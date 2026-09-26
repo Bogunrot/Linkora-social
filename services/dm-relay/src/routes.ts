@@ -5,7 +5,7 @@ import { AuthService } from "./auth";
 import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
 import { validateBody, validateQuery, validateParams } from "./middleware/validate";
 import {
-  SendMessageSchema,
+  getSendMessageSchema,
   GetMessagesQuerySchema,
   AddressParamSchema,
   ConversationIdParamSchema,
@@ -220,7 +220,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
   router.post(
     "/messages",
     messageAuth,
-    validateBody(SendMessageSchema),
+    validateBody(getSendMessageSchema()),
     idempotencyMiddleware(database),
     async (req: Request, res: Response) => {
       try {
@@ -277,15 +277,15 @@ export function createRouter(database: Database, authService: AuthService): Rout
       try {
         const address = req.params.address;
         const query = req.query as unknown as z.infer<typeof GetMessagesQuerySchema>;
-        let beforeDate: Date | undefined;
+        let cursor: { createdAt: Date; id: string } | undefined;
         if (query.cursor) {
-          beforeDate = parseCursor(query.cursor);
+          cursor = parseCursor(query.cursor);
         }
 
         const messages = await database.getMessagesByRecipient(
           address,
           query.limit + 1,
-          beforeDate
+          cursor
         );
 
         const hasMore = messages.length > query.limit;
@@ -294,7 +294,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
         let nextCursor: string | undefined;
         if (hasMore && returnMessages.length > 0) {
           const last = returnMessages[returnMessages.length - 1];
-          nextCursor = createCursor(last.created_at);
+          nextCursor = createCursor(last.created_at, last.id);
         }
 
         const responseMessages: ConversationMessage[] = returnMessages.map((msg: DbMessage) => ({
@@ -330,12 +330,12 @@ export function createRouter(database: Database, authService: AuthService): Rout
         const conversationId = req.params.conversationId;
         const query = req.query as unknown as z.infer<typeof GetMessagesQuerySchema>;
 
-        let beforeDate: Date | undefined;
+        let cursor: { createdAt: Date; id: string } | undefined;
         if (query.cursor) {
-          beforeDate = parseCursor(query.cursor);
+          cursor = parseCursor(query.cursor);
         }
 
-        const messages = await database.getMessages(conversationId, query.limit + 1, beforeDate);
+        const messages = await database.getMessages(conversationId, query.limit + 1, cursor);
 
         const hasMore = messages.length > query.limit;
         const returnMessages = hasMore ? messages.slice(0, query.limit) : messages;
@@ -343,7 +343,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
         let nextCursor: string | undefined;
         if (hasMore && returnMessages.length > 0) {
           const lastMessage = returnMessages[returnMessages.length - 1];
-          nextCursor = createCursor(lastMessage.created_at);
+          nextCursor = createCursor(lastMessage.created_at, lastMessage.id);
         }
 
         const responseMessages: ConversationMessage[] = returnMessages.map((msg: DbMessage) => ({
