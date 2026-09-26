@@ -108,10 +108,11 @@ async function createApp() {
   // Custom middleware
   app.use(requestIdMiddleware);
   app.use(requestLoggerMiddleware);
-  app.use(validateContentType);
 
-  // Rate limiting
+  // Rate limiting (before content-type validation so malformed requests are metered)
   app.use("/api", rateLimitMiddleware);
+
+  app.use(validateContentType);
 
   // API routes. Auth (message-signature for POST /messages, address-ownership
   // for GET /messages/:address) is applied per-route inside createRouter,
@@ -149,6 +150,10 @@ async function createApp() {
     server: httpServer,
     path: "/ws",
     maxPayload: config.maxMessageBytes,
+  });
+
+  wss.on("error", (err: Error) => {
+    logger.error({ err }, "WebSocket server error");
   });
 
   // Counter for DB writes that are currently executing on behalf of a
