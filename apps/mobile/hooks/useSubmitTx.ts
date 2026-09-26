@@ -27,34 +27,43 @@ interface GetTransactionResponse {
 async function rpcRequest<T>(
   rpcUrl: string,
   method: string,
-  params: unknown[]
+  params: unknown[],
+  timeoutMs: number = 30_000
 ): Promise<T> {
-  const response = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method,
-      params,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    throw new Error(`RPC HTTP error ${response.status}: ${response.statusText}`);
+  try {
+    const response = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method,
+        params,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`RPC HTTP error ${response.status}: ${response.statusText}`);
+    }
+
+    const json = (await response.json()) as { result?: T; error?: { message: string } };
+
+    if (json.error) {
+      throw new Error(`RPC error: ${json.error.message}`);
+    }
+
+    if (json.result === undefined) {
+      throw new Error("RPC returned no result");
+    }
+
+    return json.result;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const json = (await response.json()) as { result?: T; error?: { message: string } };
-
-  if (json.error) {
-    throw new Error(`RPC error: ${json.error.message}`);
-  }
-
-  if (json.result === undefined) {
-    throw new Error("RPC returned no result");
-  }
-
-  return json.result;
 }
 
 /**
@@ -146,6 +155,8 @@ export function useSubmitTx() {
           const result = await walletKit.signAndSubmitTransaction({ txXdr, rpcUrl });
           const hash = result.hash ?? result.txHash;
           if (!hash) throw new Error("Wallet returned no transaction hash");
+          // Poll for chain confirmation before reporting success
+          await pollTransaction(rpcUrl, hash);
           showSuccess(hash);
           return hash;
         }
