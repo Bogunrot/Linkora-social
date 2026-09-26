@@ -9,8 +9,9 @@
     "typecheck": "tsc --noEmit",
     "start": "next start",
     "preview": "next start",
-    "lint": "echo 'No lint configured for apps/web stub'",
+    "lint": "next lint",
     "format": "prettier --write .",
+    "test": "jest --passWithNoTests",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:headed": "playwright test --headed"
