@@ -20,8 +20,11 @@ export interface TokenMeta {
 
 export type FetchState = "idle" | "loading" | "success" | "error";
 
-// ── Stellar public key regex (G + 55 base32 chars) ───────────────────────────
+// ── Stellar address regexes ─────────────────────────────────────────────────
+// Account public key (G + 55 base32 chars) — used for admin lists
 export const STELLAR_KEY_RE = /^G[A-Z2-7]{55}$/;
+// Soroban contract address (C + 55 base32 chars) — used for token fields
+export const STELLAR_CONTRACT_RE = /^C[A-Z2-7]{55}$/;
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
