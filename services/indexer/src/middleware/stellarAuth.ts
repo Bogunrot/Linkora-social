@@ -42,13 +42,34 @@ function sweepExpiredNonces(nowMs: number): void {
  * Records the signature on a cache-miss so subsequent calls from the same
  * request are rejected.
  */
-function isReplay(signature: string, nowMs: number): boolean {
+function recordAndCheckReplay(signature: string, nowMs: number): boolean {
   sweepExpiredNonces(nowMs);
   if (seenSignatures.has(signature)) {
     return true;
   }
   seenSignatures.set(signature, { expiresAt: nowMs + SIGNATURE_TIMESTAMP_TOLERANCE_MS });
   return false;
+}
+
+/**
+ * Check if `signature` has already been seen without recording it.
+ * Used by `optionalStellarAuth` to detect replays without consuming the nonce
+ * (so that a subsequent `requireStellarAuth` on the same request still works).
+ */
+function checkReplayOnly(signature: string, nowMs: number): boolean {
+  sweepExpiredNonces(nowMs);
+  return seenSignatures.has(signature);
+}
+
+/**
+ * Record `signature` in the replay cache without checking.
+ * Used after `optionalStellarAuth` passes the signature to `requireStellarAuth`,
+ * which will record it via `recordAndCheckReplay`. This variant is for the
+ * case where optional auth already validated but we still need to consume
+ * the nonce for the required auth path.
+ */
+function recordReplay(signature: string, nowMs: number): void {
+  seenSignatures.set(signature, { expiresAt: nowMs + SIGNATURE_TIMESTAMP_TOLERANCE_MS });
 }
 
 /** Exposed for unit tests — clears the replay cache. */
@@ -229,7 +250,7 @@ export function requireStellarAuth(req: Request, res: Response, next: NextFuncti
   // The timestamp window is necessary but not sufficient: a valid signed request
   // captured within the 30 s window can be replayed. The nonce cache below
   // ensures each signature is honoured at most once.
-  if (isReplay(signature, now)) {
+  if (recordAndCheckReplay(signature, now)) {
     logger.warn(
       {
         requestId: req.context?.requestId,
@@ -310,12 +331,17 @@ export function optionalStellarAuth(req: Request, res: Response, next: NextFunct
   }
 
   // Already-seen signature — treat as anonymous (replay attempt).
-  if (isReplay(signature, now)) {
+  // Use checkReplayOnly to avoid consuming the nonce, so a subsequent
+  // requireStellarAuth on the same request chain still works.
+  if (checkReplayOnly(signature, now)) {
     next();
     return;
   }
 
   // Valid, fresh, non-replayed auth — set the address and continue.
+  // Record the nonce so that if requireStellarAuth runs next on the same
+  // request, it won't reject this as a replay.
+  recordReplay(signature, now);
   if (req.context) {
     req.context.stellarAddress = address;
   }
