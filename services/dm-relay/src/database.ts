@@ -73,41 +73,50 @@ class Database {
   }
 
   private async runMigrations(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        filename   VARCHAR(255) PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    // #1527 — Use a single checked-out client for the entire migration
+    // sequence so BEGIN/DDL/INSERT/COMMIT all execute on the same connection.
+    // Previous code used pool.query for each statement, which could check out
+    // a different client per call, leaving partial schema on failure.
+    const client = await this.pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          filename   VARCHAR(255) PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+      `);
+
+      const appliedResult = await client.query(
+        "SELECT filename FROM schema_migrations ORDER BY filename"
       );
-    `);
+      const applied = new Set(appliedResult.rows.map((r) => r.filename));
 
-    const appliedResult = await this.pool.query(
-      "SELECT filename FROM schema_migrations ORDER BY filename"
-    );
-    const applied = new Set(appliedResult.rows.map((r) => r.filename));
+      const migrationsDir = path.resolve(__dirname, "../migrations");
+      const files = fs
+        .readdirSync(migrationsDir)
+        .filter((f) => f.endsWith(".sql"))
+        .sort();
 
-    const migrationsDir = path.resolve(__dirname, "../migrations");
-    const files = fs
-      .readdirSync(migrationsDir)
-      .filter((f) => f.endsWith(".sql"))
-      .sort();
+      for (const filename of files) {
+        if (applied.has(filename)) continue;
 
-    for (const filename of files) {
-      if (applied.has(filename)) continue;
+        const sql = fs.readFileSync(path.join(migrationsDir, filename), "utf-8");
 
-      const sql = fs.readFileSync(path.join(migrationsDir, filename), "utf-8");
-
-      logger.info({ migration: filename }, "Applying migration");
-      await this.pool.query("BEGIN");
-      try {
-        await this.pool.query(sql);
-        await this.pool.query("INSERT INTO schema_migrations (filename) VALUES ($1)", [filename]);
-        await this.pool.query("COMMIT");
-        logger.info({ migration: filename }, "Migration applied");
-      } catch (error) {
-        await this.pool.query("ROLLBACK");
-        logger.error({ migration: filename, err: error }, "Migration failed");
-        throw error;
+        logger.info({ migration: filename }, "Applying migration");
+        await client.query("BEGIN");
+        try {
+          await client.query(sql);
+          await client.query("INSERT INTO schema_migrations (filename) VALUES ($1)", [filename]);
+          await client.query("COMMIT");
+          logger.info({ migration: filename }, "Migration applied");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          logger.error({ migration: filename, err: error }, "Migration failed");
+          throw error;
+        }
       }
+    } finally {
+      client.release();
     }
   }
 
@@ -143,10 +152,10 @@ class Database {
   async getMessages(
     conversationId: string,
     limit: number = 50,
-    beforeCreatedAt?: Date
+    cursor?: { createdAt: Date; id: string }
   ): Promise<DbMessage[]> {
     let query = `
-      SELECT id, conversation_id, sender, recipient, ciphertext_b64, 
+      SELECT id, conversation_id, sender, recipient, ciphertext_b64,
              message_index, timestamp, created_at
       FROM dm_messages
       WHERE conversation_id = $1
@@ -154,12 +163,14 @@ class Database {
 
     const values: (string | number | Date)[] = [conversationId];
 
-    if (beforeCreatedAt) {
-      query += " AND created_at < $2";
-      values.push(beforeCreatedAt);
+    // #1529 — Composite cursor: (created_at, id) to prevent skipping
+    // messages that share a timestamp within the same transaction.
+    if (cursor) {
+      query += " AND (created_at, id) < ($2, $3)";
+      values.push(cursor.createdAt, cursor.id);
     }
 
-    query += " ORDER BY created_at DESC LIMIT $" + (values.length + 1);
+    query += " ORDER BY created_at DESC, id DESC LIMIT $" + (values.length + 1);
     values.push(limit);
 
     const result = await this.pool.query(query, values);
@@ -169,7 +180,7 @@ class Database {
   async getMessagesByRecipient(
     recipient: string,
     limit: number = 50,
-    beforeCreatedAt?: Date
+    cursor?: { createdAt: Date; id: string }
   ): Promise<DbMessage[]> {
     let query = `
       SELECT id, conversation_id, sender, recipient, ciphertext_b64,
@@ -180,12 +191,14 @@ class Database {
 
     const values: (string | number | Date)[] = [recipient];
 
-    if (beforeCreatedAt) {
-      query += " AND created_at < $2";
-      values.push(beforeCreatedAt);
+    // #1529 — Composite cursor: (created_at, id) to prevent skipping
+    // messages that share a timestamp within the same transaction.
+    if (cursor) {
+      query += " AND (created_at, id) < ($2, $3)";
+      values.push(cursor.createdAt, cursor.id);
     }
 
-    query += " ORDER BY created_at DESC LIMIT $" + (values.length + 1);
+    query += " ORDER BY created_at DESC, id DESC LIMIT $" + (values.length + 1);
     values.push(limit);
 
     const result = await this.pool.query(query, values);
