@@ -31,6 +31,14 @@ export interface Keystore {
   pollIntervalMs: number;
   /** Human-readable source description for logging. */
   source: string;
+  /**
+   * Whether `reload()` can actually pick up new key material in a running
+   * process. The env backend cannot: `process.env` is fixed for the lifetime of
+   * the process, so `reload()` re-reads the same bytes and rotation is a silent
+   * no-op. The admin API uses this to refuse a rotation that cannot happen
+   * rather than report success (#1541).
+   */
+  supportsRotation: boolean;
   /** Reload the key from the backend (for hot rotation via the admin API). */
   reload(): Uint8Array;
 }
@@ -68,6 +76,7 @@ function fileKeystore(filePath: string): Keystore {
       return `file:${filePath}`;
     },
     pollIntervalMs: 0,
+    supportsRotation: true,
     loadSeed() {
       if (!currentSeed) currentSeed = readSeed();
       return currentSeed;
@@ -105,6 +114,10 @@ function envKeystore(envName: string): Keystore {
       return `env:${envName}`;
     },
     pollIntervalMs: 0,
+    // process.env cannot change in a running process, so reload() below can only
+    // ever re-read the same bytes. Rotation via the admin API is impossible
+    // here and must be refused rather than silently reported as successful.
+    supportsRotation: false,
     loadSeed() {
       if (!currentSeed) currentSeed = readSeed();
       return currentSeed;
