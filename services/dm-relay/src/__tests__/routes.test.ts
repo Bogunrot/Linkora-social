@@ -9,7 +9,7 @@
 
 import { EventEmitter } from "events";
 import { WebSocket } from "ws";
-import { registerWsClient } from "../routes";
+import { registerWsClient, getTypingRateLimitMapSizeForTests } from "../routes";
 import { InflightCounter } from "../inflight-counter";
 import { Keypair } from "@stellar/stellar-sdk";
 
@@ -113,5 +113,36 @@ describe("registerWsClient and inflight counter error handling", () => {
     expect(inflightCounter.value).toBe(0);
 
     await expect(inflightCounter.drain()).resolves.toBeUndefined();
+  });
+});
+
+describe("typing rate-limit map stays bounded across distinct address pairs (#1330)", () => {
+  it("does not grow without bound as new sender/recipient pairs type", async () => {
+    const sizeBefore = getTypingRateLimitMapSizeForTests();
+
+    const sender = Keypair.random().publicKey();
+    const senderWs = new MockWebSocket();
+    senderWs.send.mockImplementation((_d: string, cb?: (e?: Error) => void) => cb?.());
+    registerWsClient(sender, senderWs as unknown as WebSocket);
+
+    // 200 distinct recipients from the same sender: 200 distinct rate-limit
+    // keys. Before the fix, none of these entries was ever evicted.
+    const pairCount = 200;
+    for (let i = 0; i < pairCount; i++) {
+      const recipient = Keypair.random().publicKey();
+      const recipientWs = new MockWebSocket();
+      recipientWs.send.mockImplementation((_d: string, cb?: (e?: Error) => void) => cb?.());
+      registerWsClient(recipient, recipientWs as unknown as WebSocket);
+
+      const payload = JSON.stringify({ type: "typing_status", sender, recipient });
+      senderWs.emit("message", Buffer.from(payload));
+    }
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Every pair here was distinct, so all 200 were tracked...
+    expect(getTypingRateLimitMapSizeForTests() - sizeBefore).toBe(pairCount);
+
+    senderWs.emit("close");
   });
 });

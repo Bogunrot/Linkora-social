@@ -253,7 +253,14 @@ describe("dm-relay loadConfig", () => {
 });
 
 describe("dm-relay health endpoints", () => {
-  const db = { ping: jest.fn().mockResolvedValue(undefined) } as unknown as Database;
+  const db = {
+    ping: jest.fn().mockResolvedValue(undefined),
+    getPoolHealth: jest.fn().mockResolvedValue({
+      status: "healthy",
+      latencyMs: 1,
+      metrics: { totalCount: 1, idleCount: 1, waitingCount: 0 },
+    }),
+  } as unknown as Database;
 
   interface HealthResponse {
     status: string;

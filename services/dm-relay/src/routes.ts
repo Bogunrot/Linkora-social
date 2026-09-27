@@ -2,7 +2,11 @@ import { Router, Request, Response } from "express";
 import { WebSocket } from "ws";
 import { Database, DbMessage } from "./database";
 import { AuthService } from "./auth";
-import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
+import {
+  messageAuthMiddleware,
+  addressOwnershipMiddleware,
+  conversationParticipantMiddleware,
+} from "./middleware/auth";
 import { rateLimitMiddleware } from "./middleware/rateLimit";
 import { validateBody, validateQuery, validateParams } from "./middleware/validate";
 import {
@@ -13,6 +17,7 @@ import {
   parseCursor,
   createCursor,
   getMaxMessageBytes,
+  type SendMessageRequest,
 } from "./validation";
 import { stellarAddressSchema } from "@linkora/types/src/schemas";
 import { createConversationId, sanitizeError } from "./utils";
@@ -26,11 +31,25 @@ import {
   internalError,
 } from "@linkora/types/src/errors";
 import type { InflightCounter } from "./inflight-counter";
+import { TypingRateLimitMap } from "./typing-rate-limit";
 
 const CLOSE_MESSAGE_TOO_LARGE = 1009;
 
+/** Typing-notification throttle window; entries older than this are pruned (#1330). */
+const TYPING_RATE_LIMIT_WINDOW_MS = 3000;
+/** Hard cap on distinct (sender, recipient) pairs tracked at once (#1330). */
+const TYPING_RATE_LIMIT_MAX_PAIRS = 50_000;
+
 const wsClients = new Map<string, Set<WebSocket>>();
-const typingRateLimitMap = new Map<string, number>();
+const typingRateLimitMap = new TypingRateLimitMap(
+  TYPING_RATE_LIMIT_WINDOW_MS,
+  TYPING_RATE_LIMIT_MAX_PAIRS
+);
+
+/** Test-only accessor for the typing rate-limit map's current size (#1330). */
+export function getTypingRateLimitMapSizeForTests(): number {
+  return typingRateLimitMap.size;
+}
 
 /**
  * Register a WebSocket client for a given Stellar address.
@@ -89,16 +108,16 @@ export function registerWsClient(
         }
 
         const rateLimitKey = `${address}:${recipient}`;
-        const lastSent = typingRateLimitMap.get(rateLimitKey) || 0;
         const now = Date.now();
-        if (now - lastSent < 3000) {
+        const lastSent = typingRateLimitMap.get(rateLimitKey, now);
+        if (lastSent !== undefined && now - lastSent < TYPING_RATE_LIMIT_WINDOW_MS) {
           logger.warn(
             { authenticatedAddress: address, recipient },
             "Typing notification rate limit exceeded"
           );
           return;
         }
-        typingRateLimitMap.set(rateLimitKey, now);
+        typingRateLimitMap.touch(rateLimitKey, now);
 
         // Track this DB write so the shutdown handler can wait for it.
         inflightCounter?.increment();
@@ -210,6 +229,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
   const router = Router();
   const messageAuth = messageAuthMiddleware(authService);
   const addressAuth = addressOwnershipMiddleware(authService);
+  const conversationAuth = conversationParticipantMiddleware(authService, database);
 
   /**
    * POST /messages - Submit an encrypted message
@@ -226,7 +246,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
     idempotencyMiddleware(database),
     async (req: Request, res: Response) => {
       try {
-        const messageData = req.body as z.infer<typeof SendMessageSchema>;
+        const messageData = req.body as SendMessageRequest;
 
         const conversationId = createConversationId(messageData.sender, messageData.recipient);
 
@@ -285,11 +305,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
           cursor = parseCursor(query.cursor);
         }
 
-        const messages = await database.getMessagesByRecipient(
-          address,
-          query.limit + 1,
-          cursor
-        );
+        const messages = await database.getMessagesByRecipient(address, query.limit + 1, cursor);
 
         const hasMore = messages.length > query.limit;
         const returnMessages = hasMore ? messages.slice(0, query.limit) : messages;
@@ -324,8 +340,16 @@ export function createRouter(database: Database, authService: AuthService): Rout
     }
   );
 
+  /**
+   * GET /messages/conversation/:conversationId - Fetch messages by conversation id.
+   *
+   * Requires the caller to authenticate as one of the conversation's
+   * participants (issue #1331) — a conversation id alone is derivable from
+   * any two addresses and must not be treated as a capability.
+   */
   router.get(
     "/messages/conversation/:conversationId",
+    conversationAuth,
     rateLimitMiddleware,
     validateParams(ConversationIdParamSchema),
     validateQuery(GetMessagesQuerySchema),

@@ -19,6 +19,7 @@
 
 import http from "http";
 import { InstrumentedPool } from "./instrumented-pool";
+import { attachPoolMonitoring } from "./db-pool-monitor";
 import { streamEvents, backfillStartupGap, RawEvent, BatchProcessor } from "./stream";
 import { IngestPipeline, IngestEvent } from "./pipeline";
 import { bus } from "./bus";
@@ -69,6 +70,13 @@ const pgPool = new InstrumentedPool(SLOW_QUERY_THRESHOLD_MS, {
   connectionTimeoutMillis: cfg.dbPool.connectionTimeoutMs,
   min: cfg.pgPoolMin,
 });
+
+// pool.on('error') is required: pg.Pool emits it when an idle client dies
+// (e.g. Postgres restarts underneath it), and Node treats an 'error' event
+// with no listener as fatal — this is what turned "Connection terminated
+// unexpectedly" into a process crash rather than a logged, discarded client
+// (issue #888).
+attachPoolMonitoring(pgPool, { logger, serviceName: "indexer" });
 
 logger.info(
   {

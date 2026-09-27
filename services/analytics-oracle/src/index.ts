@@ -12,7 +12,8 @@ import { submitAttestation } from "./submitter.js";
 import { AnalyticsReport, SignedAttestation } from "./types.js";
 import { logger } from "./logger.js";
 import { rateLimiter, initRateLimiter } from "./middleware/rate-limiter.js";
-import { loadRateLimitConfig } from "./config.js";
+import { loadRateLimitConfig, dbPoolConfig } from "./config.js";
+import { attachPoolMonitoring } from "./db-pool-monitor.js";
 import { createHealthRouter } from "./routes/health.js";
 import { createAdminRouter } from "./routes/admin.js";
 import { validateParams } from "./middleware/validate.js";
@@ -61,7 +62,19 @@ const oracleSeed = keystore.loadSeed();
 const oracleSigner = new Signer(oracleSeed);
 keystore.zeroise();
 
-const db = new Pool({ connectionString: DATABASE_URL });
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  max: dbPoolConfig.max,
+  idleTimeoutMillis: dbPoolConfig.idleTimeoutMillis,
+  connectionTimeoutMillis: dbPoolConfig.connectionTimeoutMillis,
+});
+// pool.on('error') is required: pg.Pool emits it when an idle client dies,
+// and an 'error' event with no listener crashes the process (issue #888).
+attachPoolMonitoring(db, {
+  logger,
+  serviceName: "analytics-oracle",
+  statsIntervalMs: dbPoolConfig.statsIntervalMs,
+});
 
 /** Shared rpc.Server instance — created once at startup and reused for all
  *  Soroban RPC calls (ledger polling + attestation submission). */

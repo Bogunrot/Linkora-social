@@ -19,6 +19,7 @@ import { Pool } from "pg";
 import type { RateLimitStoreStatus } from "@linkora/types/src/rate-limit-env.js";
 import { logger } from "../logger.js";
 import { getRateLimitStoreStatus } from "../middleware/rate-limiter.js";
+import { getPoolMetrics } from "../db-pool-monitor.js";
 
 /** Slow-check warning threshold in ms — logs a warning but does not fail. */
 const DB_SLOW_THRESHOLD_MS = 1_000;
@@ -46,18 +47,24 @@ export interface HealthDeps {
 async function checkDatabase(db: Pool): Promise<DependencyCheck> {
   const start = Date.now();
   let client;
+  // pg's PoolClient has no public "was this already released" flag, so the
+  // guard against a double release() is tracked locally instead (fixes a
+  // pre-existing reference to a nonexistent `client._released` property).
+  let released = false;
   try {
     client = await db.connect();
 
     // Race the health-check query against an AbortController timer so the
-    // health endpoint never blocks beyond DB_HEALTH_TIMEOUT_MS regardless of
-    // whether the pg driver honours statement_timeout in all edge cases.
+    // health endpoint never blocks beyond DB_HEALTH_TIMEOUT_MS. `statement_timeout`
+    // is a session/pool-level setting, not a per-query option — pg's query()
+    // only accepts positional parameters as its second argument — so the
+    // timeout here is enforced solely by this race, not by the query call.
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), DB_HEALTH_TIMEOUT_MS);
 
     try {
       await Promise.race([
-        client.query("SELECT 1", { statement_timeout: DB_HEALTH_TIMEOUT_MS }),
+        client.query("SELECT 1"),
         new Promise<never>((_resolve, reject) => {
           ac.signal.addEventListener("abort", () =>
             reject(new Error(`Database health check timed out after ${DB_HEALTH_TIMEOUT_MS}ms`))
@@ -87,11 +94,12 @@ async function checkDatabase(db: Pool): Promise<DependencyCheck> {
 
     if (isTimeout && client) {
       client.release(true);
+      released = true;
     }
 
     return { status: "down", latencyMs, error: isTimeout ? "timeout" : "error" };
   } finally {
-    if (client && !client._released) {
+    if (client && !released) {
       client.release();
     }
   }
@@ -158,6 +166,10 @@ export function createHealthRouter(deps: HealthDeps): Router {
       checkDatabase(deps.db),
       checkStellarRpc(deps.rpcUrl),
     ]);
+    // Synchronous pool-utilisation snapshot (issue #888) — a saturated pool
+    // (waitingCount > 0) is visible here before it manifests as the next
+    // request's connection timeout.
+    const pool = getPoolMetrics(deps.db);
 
     const healthy = database.status === "up" && stellar_rpc.status === "up";
     const status = healthy ? (rateLimiter.shared ? "ok" : "degraded") : "degraded";
@@ -166,7 +178,7 @@ export function createHealthRouter(deps: HealthDeps): Router {
       status,
       uptime,
       rateLimiter,
-      checks: { database, stellar_rpc },
+      checks: { database, stellar_rpc, pool },
     });
   });
 
