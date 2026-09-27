@@ -209,29 +209,32 @@ export const OptimisticStore = {
   onRolledBack,
 
   // Reconcile optimistic like/tip state against a fresh feed response (#1203).
-  // After a refetch the server is the source of truth: optimistic entries for
-  // the current user are pruned so the UI falls back to server-confirmed
-  // initialState. Tip entries (keyed only by postId) are scoped to no single
-  // user, so they are pruned wholesale.
+  // Prune only entries whose post id is absent from the supplied list so that
+  // optimistic state for posts still on screen is preserved across refetches.
   reconcileFeed(user: string | null, posts: Array<{ id: number | string }>) {
     if (!user) return;
 
+    const liveIds = new Set(posts.map((p) => String(p.id)));
     let pruned = false;
 
-    // Like keys are `${userAddress}:${postId}`.
+    // Like keys are `${userAddress}:${postId}` — only prune when the post is
+    // no longer in the returned page.
     for (const key of [...likeStateMap.keys()]) {
-      if (key.startsWith(`${user}:`)) {
+      const [keyUser, postId] = key.split(":");
+      if (keyUser === user && !liveIds.has(postId)) {
         likeStateMap.delete(key);
         likeSnapshots.delete(key);
         pruned = true;
       }
     }
 
-    // Tip keys are the bare postId string.
+    // Tip keys are the bare postId string — same rule.
     for (const key of [...tipStateMap.keys()]) {
-      tipStateMap.delete(key);
-      tipSnapshots.delete(key);
-      pruned = true;
+      if (!liveIds.has(key)) {
+        tipStateMap.delete(key);
+        tipSnapshots.delete(key);
+        pruned = true;
+      }
     }
 
     if (pruned) notify();
