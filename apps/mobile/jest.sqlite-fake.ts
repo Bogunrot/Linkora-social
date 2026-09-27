@@ -122,6 +122,32 @@ export function createFakeDb() {
         return;
       }
 
+      // A plain single-row 'synced' insert (no ON CONFLICT), used by migration
+      // tests to seed a row in a specific state.
+      if (sql.includes("INSERT INTO cached_posts") && sql.includes("'synced'")) {
+        const [id, author, username, content, timestamp, created_at] = params as [
+          string,
+          string,
+          string,
+          string,
+          number,
+          number,
+        ];
+        cachedPosts.set(id, {
+          id,
+          author,
+          username,
+          content,
+          tip_total: 0,
+          timestamp,
+          like_count: 0,
+          has_liked: 0,
+          sync_status: "synced",
+          created_at,
+        });
+        return;
+      }
+
       if (
         sql.includes("DELETE FROM cached_posts") &&
         sql.includes("sync_status IN ('pending', 'failed')")
@@ -142,9 +168,24 @@ export function createFakeDb() {
         return;
       }
 
+      // Row-count cap: keep the `LIMIT ?` newest synced rows by timestamp.
       if (
         sql.includes("DELETE FROM cached_posts") &&
-        sql.includes("sync_status = 'synced' AND id NOT IN")
+        /ORDER\s+BY\s+timestamp\s+DESC/.test(sql)
+      ) {
+        const [maxRows] = params as [number];
+        const synced = Array.from(cachedPosts.entries())
+          .filter(([, row]) => row.sync_status === "synced")
+          .sort((a, b) => Number(b[1].timestamp) - Number(a[1].timestamp));
+        for (const [key] of synced.slice(maxRows)) {
+          cachedPosts.delete(key);
+        }
+        return;
+      }
+
+      if (
+        sql.includes("DELETE FROM cached_posts") &&
+        /\bsync_status\s*=\s*'synced'\s+AND\s+id\s+NOT\s+IN\b/.test(sql)
       ) {
         const keepIds = new Set(params as string[]);
         for (const [key, row] of cachedPosts) {
@@ -159,6 +200,30 @@ export function createFakeDb() {
         const [id] = params as [string];
         const row = cachedPosts.get(id);
         if (row) row.sync_status = "failed";
+        return;
+      }
+
+      // Repair migration (#1543): rows whose `timestamp` column holds a Stellar
+      // ledger sequence are restored to the real wall-clock second they were
+      // synced at.
+      if (sql.includes("UPDATE cached_posts SET timestamp = created_at WHERE timestamp <")) {
+        const [threshold] = params as [number];
+        for (const row of cachedPosts.values()) {
+          if (Number(row.timestamp) < threshold) row.timestamp = row.created_at;
+        }
+        return;
+      }
+
+      if (
+        sql.includes("DELETE FROM cached_posts") &&
+        /\bsync_status\s*=\s*'synced'\s+AND\s+timestamp\s*</.test(sql)
+      ) {
+        const [cutoff] = params as [number];
+        for (const [key, row] of cachedPosts) {
+          if (row.sync_status === "synced" && Number(row.timestamp) < cutoff) {
+            cachedPosts.delete(key);
+          }
+        }
         return;
       }
 
@@ -313,6 +378,12 @@ export function createFakeDb() {
       if (sql.includes("FROM cached_posts WHERE id = ?")) {
         const [id] = params as [string];
         return cachedPosts.get(id) ?? null;
+      }
+      if (sql.includes("MAX(timestamp)") && sql.includes("FROM cached_posts")) {
+        const timestamps = Array.from(cachedPosts.values())
+          .filter((row) => row.sync_status === "synced")
+          .map((row) => Number(row.timestamp));
+        return { max_ts: timestamps.length > 0 ? Math.max(...timestamps) : null };
       }
       const [conversation_id] = params as [string];
       const state = dmSyncState.get(conversation_id);

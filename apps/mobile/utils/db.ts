@@ -90,10 +90,18 @@ function rowToDmMessage(row: DmMessageRow): DmMessage {
 export interface MigratableDb {
   execAsync(sql: string): Promise<unknown>;
   getFirstAsync(sql: string): Promise<unknown>;
+  runAsync(sql: string, params: SQLite.SQLiteBindParams): Promise<unknown>;
   withTransactionAsync(fn: () => Promise<void>): Promise<void>;
 }
 
 export type Migration = (db: MigratableDb) => Promise<void>;
+
+/**
+ * Earliest plausible seconds-since-epoch for a post (2001-09-09). A Stellar
+ * ledger sequence is around 5x10^7 — two orders of magnitude below this — so any
+ * `timestamp` under it is a unit mix-up rather than a real time (#1543).
+ */
+export const MIN_PLAUSIBLE_TIMESTAMP = 1_000_000_000;
 
 /**
  * Ordered schema migrations, applied in sequence and tracked via
@@ -149,6 +157,18 @@ export const MIGRATIONS: Migration[] = [
         last_read INTEGER NOT NULL DEFAULT 0
       );
     `);
+  },
+  // v1 -> v2: repair rows poisoned by the ledger/timestamp unit mix-up (#1543).
+  // `created_ledger` (a sequence number, ~5e7) was written into `timestamp`
+  // (seconds since epoch, ~1.8e9), which made every post render as ~20000 days
+  // old and made evictStaleCache delete the whole cache on the first refresh.
+  // `created_at` is the real wall-clock second the row was synced, so it is the
+  // only correct recovery available for a row that is already in the wild.
+  async (db) => {
+    await db.runAsync(
+      `UPDATE cached_posts SET timestamp = created_at WHERE timestamp < ?`,
+      [MIN_PLAUSIBLE_TIMESTAMP]
+    );
   },
 ];
 
@@ -358,15 +378,41 @@ export async function getPendingPosts(): Promise<Post[]> {
 
 /**
  * Evicts old posts to keep the cache lightweight.
+ *
+ * Age-based eviction is skipped when the *newest* synced row is itself older
+ * than the cutoff. That state means every cached row looks ancient, which is
+ * either a unit bug (a Stellar ledger sequence written into the timestamp
+ * column, whose cutoff is `now - 7d` while the values are ~5x10^7) or a device
+ * that has genuinely not synced for over a week. Deleting on that signal wipes
+ * the entire offline cache on the first refresh, and the user has no way to
+ * re-fetch it while offline — so only the row-count cap is applied and the
+ * anomaly is reported instead (#1543).
  */
 export async function evictStaleCache(
   maxAgeSeconds: number = 86400 * 7,
   maxRows: number = 100
 ): Promise<void> {
   const cutoff = Math.floor(Date.now() / 1000) - maxAgeSeconds;
-  await db.runAsync(`DELETE FROM cached_posts WHERE sync_status = 'synced' AND timestamp < ?`, [
-    cutoff,
-  ]);
+  const newestRow = await db.getFirstAsync<{ max_ts: number | string | null }>(
+    `SELECT MAX(timestamp) AS max_ts FROM cached_posts WHERE sync_status = 'synced'`
+  );
+  const maxTimestamp = newestRow?.max_ts ?? null;
+  const newestTimestamp = maxTimestamp === null ? null : Number(maxTimestamp);
+  const everyRowIsStale =
+    newestTimestamp !== null && Number.isFinite(newestTimestamp) && newestTimestamp < cutoff;
+
+  if (everyRowIsStale) {
+    console.warn(
+      `Cache eviction: newest synced post is older than the cutoff (newest=${newestTimestamp}, cutoff=${cutoff}). ` +
+        "Skipping age-based eviction to avoid wiping the offline cache."
+    );
+  } else {
+    await db.runAsync(
+      `DELETE FROM cached_posts WHERE sync_status = 'synced' AND timestamp < ?`,
+      [cutoff]
+    );
+  }
+
   await db.runAsync(
     `DELETE FROM cached_posts
      WHERE sync_status = 'synced'

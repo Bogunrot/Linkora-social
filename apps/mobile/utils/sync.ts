@@ -2,6 +2,7 @@ import {
   addOutboxDmMessage,
   confirmPendingPost,
   DmMessage,
+  getCachedPostById,
   getCachedPostsByIds,
   getDmSyncCursor,
   getPendingPosts,
@@ -20,6 +21,110 @@ export { UnknownRecipientKeyError };
 
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+// ── Ledger sequence → Unix seconds ────────────────────────────────────────────
+
+/** Target seconds between Stellar ledger closes. */
+const LEDGER_CLOSE_SECONDS = 5;
+
+/** Unix timestamp of Stellar network genesis (2015-09-01T00:00:00Z). */
+const STELLAR_GENESIS_UNIX_SECONDS = Math.floor(
+  new Date("2015-09-01T00:00:00Z").getTime() / 1000
+);
+
+/**
+ * Convert a Stellar *ledger sequence number* into seconds since the Unix epoch.
+ *
+ * A ledger sequence is an ordinal — a mainnet ledger is around 5x10^7 — and
+ * must never be written into a column the app treats as a Unix timestamp,
+ * which is around 1.8x10^9. Assigning one to the other rendered every post as
+ * "20115d ago" and made every cached row look ancient, wiping the offline cache
+ * on the first sync (#1543). Mirrors `apps/web/src/lib/analytics.ts`.
+ */
+export function ledgerToUnixSeconds(ledger: number): number {
+  return STELLAR_GENESIS_UNIX_SECONDS + (ledger - 1) * LEDGER_CLOSE_SECONDS;
+}
+
+/**
+ * The subset of an indexer `/api/posts` row this module consumes, after the
+ * ledger field has been renamed to make its unit unambiguous.
+ *
+ * `createdLedger` is a ledger SEQUENCE, not a timestamp — pass it through
+ * {@link ledgerToUnixSeconds} before it reaches anything that stores or renders
+ * a `Post.timestamp`.
+ */
+export interface IndexerPost {
+  id: string;
+  author: string;
+  content: string | null;
+  username: string | null;
+  tipTotal: number;
+  createdLedger: number | null;
+  likeCount: number;
+  hasLiked: boolean;
+}
+
+/** The raw JSON shape returned by the indexer (`created_ledger`, snake_case). */
+interface IndexerPostWire {
+  id?: unknown;
+  author?: unknown;
+  content?: unknown;
+  username?: unknown;
+  tip_total?: unknown;
+  created_ledger?: unknown;
+  like_count?: unknown;
+  has_liked?: unknown;
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function optionalNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+/**
+ * Type boundary between the indexer's wire format and the app's domain types.
+ *
+ * This is where `created_ledger` becomes `createdLedger`: renaming it at the
+ * boundary is what stops the two units from being confused again, since a
+ * ledger sequence assigned to a `Post.timestamp` fails silently (no type error,
+ * just a nonsense age and a wiped cache) rather than loudly.
+ */
+export function normalizeIndexerPost(wire: IndexerPostWire): IndexerPost {
+  return {
+    id: String(wire.id),
+    author: typeof wire.author === "string" ? wire.author : "",
+    content: optionalString(wire.content),
+    username: optionalString(wire.username),
+    tipTotal: optionalNumber(wire.tip_total) ?? 0,
+    createdLedger: optionalNumber(wire.created_ledger),
+    likeCount: optionalNumber(wire.like_count) ?? 0,
+    hasLiked: wire.has_liked === true,
+  };
+}
+
+/**
+ * The post's creation time in seconds since the epoch, converting the indexer's
+ * ledger sequence at the boundary. Falls back to "now" when the indexer omitted
+ * the ledger, which is strictly better than a value 20000 days in the past.
+ */
+export function indexerPostTimestamp(post: IndexerPost, nowSeconds: number): number {
+  return post.createdLedger !== null ? ledgerToUnixSeconds(post.createdLedger) : nowSeconds;
+}
+
+function normalizeIndexerPosts(raw: unknown): IndexerPost[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((row): row is IndexerPostWire => typeof row === "object" && row !== null)
+    .map(normalizeIndexerPost);
 }
 
 /**
@@ -41,34 +146,34 @@ export async function fetchAndCachePosts(limit: number, offset: number, evictSta
   }
 
   const data = await res.json();
-  const indexerPosts = data.posts || [];
+  const indexerPosts = normalizeIndexerPosts(data.posts);
   const finalPosts: Post[] = [];
+  const nowSeconds = Math.floor(Date.now() / 1000);
 
   // 2. Fetch content/profile details for each post, using local cache as much as possible.
   // A single batched lookup replaces one `getCachedPostById` call per post.
-  const cachedById = await getCachedPostsByIds(indexerPosts.map((ip) => String(ip.id)));
+  const cachedById = await getCachedPostsByIds(indexerPosts.map((ip) => ip.id));
 
   for (const ip of indexerPosts) {
-    const cached = cachedById.get(String(ip.id));
+    const cached = cachedById.get(ip.id);
     let content = cached?.content;
     let username = cached?.username || "stellar_user";
 
     if (!content) {
-      content =
-        typeof ip.content === "string" && ip.content ? ip.content : "Content unavailable offline";
-      username =
-        typeof ip.username === "string" && ip.username ? ip.username : shortAddress(ip.author);
+      content = ip.content ?? "Content unavailable offline";
+      username = ip.username ?? shortAddress(ip.author);
     }
 
     finalPosts.push({
-      id: String(ip.id),
+      id: ip.id,
       author: ip.author,
       username,
       content,
-      tip_total: Number(ip.tip_total || 0),
-      timestamp: ip.created_ledger || Math.floor(Date.now() / 1000),
-      like_count: Number(ip.like_count || 0),
-      has_liked: ip.has_liked || false,
+      tip_total: ip.tipTotal,
+      // createdLedger is a sequence number, never a timestamp — convert here.
+      timestamp: indexerPostTimestamp(ip, nowSeconds),
+      like_count: ip.likeCount,
+      has_liked: ip.hasLiked,
     });
   }
 
@@ -76,6 +181,68 @@ export async function fetchAndCachePosts(limit: number, offset: number, evictSta
   await reconcilePosts(finalPosts, evictStale);
 
   return finalPosts;
+}
+
+/**
+ * Fetches a single post from the indexer by id, bypassing the local cache.
+ *
+ * The detail screen needs this: a post reached by deep link, notification or
+ * share is rarely inside the newest cached page, and a cache-only screen then
+ * renders "not found" for a post that plainly exists (#1544). Returns null when
+ * the indexer has no such post, and throws on a transport/protocol failure so
+ * the caller can distinguish "gone" from "could not ask".
+ */
+export async function fetchPostById(id: string): Promise<Post | null> {
+  const indexerUrl = getIndexerBaseUrl();
+  const res = await fetch(`${indexerUrl}/api/posts/${encodeURIComponent(id)}`);
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`Failed to fetch post ${id} from indexer (status ${res.status})`);
+  }
+
+  const data = (await res.json()) as { post?: unknown } | unknown;
+  const wire = Array.isArray(data)
+    ? (data as unknown[])[0]
+    : ((data as { post?: unknown }).post ?? data);
+  if (typeof wire !== "object" || wire === null) return null;
+
+  const post = normalizeIndexerPost(wire as IndexerPostWire);
+  return {
+    id: post.id,
+    author: post.author,
+    username: post.username ?? shortAddress(post.author),
+    content: post.content ?? "Content unavailable offline",
+    tip_total: post.tipTotal,
+    timestamp: indexerPostTimestamp(post, Math.floor(Date.now() / 1000)),
+    like_count: post.likeCount,
+    has_liked: post.hasLiked,
+    sync_status: "synced",
+  };
+}
+
+/**
+ * Resolves a post for the detail screen: local cache first, then the indexer.
+ *
+ * A cache hit renders instantly and offline. A cache miss falls back to the
+ * network and writes the row back, so the next open is served from SQLite even
+ * offline. The fallback is exposed as a standalone function so the screen can
+ * bind a retry action to it.
+ */
+export async function resolvePostWithFallback(id: string): Promise<Post | null> {
+  const cached = await getCachedPostById(id);
+  if (cached) return cached;
+
+  const fetched = await fetchPostById(id);
+  if (!fetched) return null;
+
+  // Persist the fetched row so the next open of this post is served offline.
+  // evictStale=false: a single deep-linked post must not evict the feed page.
+  try {
+    await reconcilePosts([fetched], false);
+  } catch (err) {
+    console.warn("Failed to cache deep-linked post:", err);
+  }
+  return fetched;
 }
 
 interface WalletKitLike {

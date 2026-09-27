@@ -111,6 +111,12 @@ async function runWindow(windowStart: bigint, windowEnd: bigint): Promise<void> 
     return;
   }
 
+  // Creators whose submission failed. A window that could not be fully
+  // attested is NOT treated as processed: runWindow rethrows at the end so
+  // scheduleLoop retries the window instead of advancing lastWindowEnd past a
+  // creator that was never confirmed on chain (#1536).
+  const failedCreators: string[] = [];
+
   for (const s of stats) {
     try {
       let creatorBytes: Uint8Array;
@@ -165,6 +171,7 @@ async function runWindow(windowStart: bigint, windowEnd: bigint): Promise<void> 
         logger.info({ creatorAddress: s.creatorAddress, txHash }, "Creator attested");
       } catch (err) {
         logger.error({ creatorAddress: s.creatorAddress, err }, "Attestation submission failed");
+        failedCreators.push(s.creatorAddress);
         continue;
       }
 
@@ -182,8 +189,15 @@ async function runWindow(windowStart: bigint, windowEnd: bigint): Promise<void> 
       });
     } catch (err) {
       logger.error({ creatorAddress: s.creatorAddress, err }, "Error processing creator stats");
+      failedCreators.push(s.creatorAddress);
       continue;
     }
+  }
+
+  if (failedCreators.length > 0) {
+    throw new Error(
+      `Window ${windowStart.toString()}..${windowEnd.toString()}: ${failedCreators.length} creator(s) failed to submit a confirmed attestation: ${failedCreators.join(", ")}`
+    );
   }
 }
 

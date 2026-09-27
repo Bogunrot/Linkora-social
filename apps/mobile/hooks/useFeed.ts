@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Post } from "../components/PostCard";
 import { initDatabase, getCachedPosts, evictStaleCache } from "../utils/db";
-import { fetchAndCachePosts, getSyncPendingPostsOptions, syncPendingPosts } from "../utils/sync";
+import {
+  fetchAndCachePosts,
+  fetchPostById,
+  getSyncPendingPostsOptions,
+  resolvePostWithFallback,
+  syncPendingPosts,
+} from "../utils/sync";
 import { useNetworkContext } from "../context/NetworkContext";
 
 const PAGE_SIZE = 10;
@@ -20,13 +26,26 @@ export function subscribeToFeedUpdates(listener: () => void): () => void {
   };
 }
 
+/**
+ * Resolves a post for a detail screen: local cache first, then the indexer.
+ *
+ * The detail screen used to resolve its content from SQLite alone, so every
+ * deep link, share and notification target for a post outside the newest cached
+ * page rendered "not found" (#1544).
+ */
 export function getFeedPostById(postId: string): Promise<Post | null> {
-  // Return via DB import if needed, or query cache.
-  // Note: Since this is now async, screens should fetch it asynchronously.
-  return import("../utils/db").then((db) => db.getCachedPostById(postId));
+  return resolvePostWithFallback(postId);
 }
 
 export const getFeedPost = getFeedPostById;
+
+/**
+ * Retry action for a post the screen could not load: forces a fresh indexer
+ * fetch, bypassing the cache, and writes the result back.
+ */
+export function retryPostFetch(postId: string): Promise<Post | null> {
+  return fetchPostById(postId);
+}
 
 export function markFeedPostDeleted(postId: string | number): void {
   // Mark post deleted in local cache

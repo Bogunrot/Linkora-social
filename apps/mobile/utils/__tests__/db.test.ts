@@ -14,6 +14,7 @@ jest.mock("expo-sqlite", () => ({
 import {
   addOutboxDmMessage,
   addOptimisticPost,
+  evictStaleCache,
   getCachedPostsByIds,
   getDmLastRead,
   getDmMessages,
@@ -279,5 +280,93 @@ describe("schema migrations (#1560)", () => {
     await runMigrations(fixtureDb, [MIGRATIONS[0]]);
 
     expect(fixtureDb.execAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe("evictStaleCache (#1543)", () => {
+  const NOW = () => Math.floor(Date.now() / 1000);
+
+  it("retains every cached post across a sync followed by ten foregrounds", async () => {
+    const ids = Array.from({ length: 10 }, (_, i) => `retain-${i}`);
+    await reconcilePosts(ids.map((id, i) => makePost(id, { timestamp: NOW() - i * 60 })));
+
+    // useFeed evicts on every replace-sync; feed.tsx evicts on every foreground.
+    for (let i = 0; i < 10; i++) {
+      await evictStaleCache(86400 * 7, 100);
+    }
+
+    const cached = await getCachedPostsByIds(ids);
+    for (const id of ids) {
+      expect(cached.has(id)).toBe(true);
+    }
+  });
+
+  it("does not wipe the cache when every row's timestamp is implausibly old", async () => {
+    // A Stellar ledger sequence written into the timestamp column: ~5e7 versus a
+    // cutoff of `now - 7d`. Age-based eviction would delete the entire offline
+    // cache on the first refresh, leaving nothing to serve while offline.
+    const ids = ["ledger-poisoned-1", "ledger-poisoned-2", "ledger-poisoned-3"];
+    await reconcilePosts(ids.map((id) => makePost(id, { timestamp: 52_000_000 })));
+
+    await evictStaleCache(86400 * 7, 100);
+
+    const cached = await getCachedPostsByIds(ids);
+    for (const id of ids) {
+      expect(cached.has(id)).toBe(true);
+    }
+  });
+
+  it("still evicts genuinely stale rows when a plausible newer row exists", async () => {
+    await reconcilePosts([
+      makePost("stale-old", { timestamp: NOW() - 86400 * 30 }),
+      makePost("fresh-row", { timestamp: NOW() }),
+    ]);
+
+    await evictStaleCache(86400 * 7, 100);
+
+    const cached = await getCachedPostsByIds(["stale-old", "fresh-row"]);
+    expect(cached.has("stale-old")).toBe(false);
+    expect(cached.has("fresh-row")).toBe(true);
+  });
+});
+
+describe("timestamp unit repair migration (#1543)", () => {
+  it("restores poisoned timestamps from created_at for an already-installed database", async () => {
+    const fixtureDb = mockCreateFakeDb();
+
+    // An install that already ran the v0 -> v1 bootstrap and synced posts with
+    // the raw ledger sequence in the timestamp column.
+    await runMigrations(fixtureDb, [MIGRATIONS[0]]);
+    await fixtureDb.runAsync(
+      `INSERT INTO cached_posts (id, author, username, content, tip_total, timestamp, like_count, has_liked, sync_status, created_at)
+       VALUES (?, ?, ?, ?, 0, ?, 0, 0, 'synced', ?)`,
+      ["poisoned", "GAUTHOR", "user", "hello", 52_000_000, 1_700_000_000]
+    );
+    expect(fixtureDb.__state.cachedPosts.get("poisoned")).toMatchObject({ timestamp: 52_000_000 });
+
+    await runMigrations(fixtureDb);
+
+    expect(fixtureDb.__state.userVersion).toBe(MIGRATIONS.length);
+    // The ledger sequence is replaced with the real second the row was synced,
+    // so the row is neither 20000 days old nor a cache-eviction candidate.
+    expect(fixtureDb.__state.cachedPosts.get("poisoned")).toMatchObject({
+      timestamp: 1_700_000_000,
+    });
+  });
+
+  it("leaves a plausible timestamp untouched", async () => {
+    const fixtureDb = mockCreateFakeDb();
+    await runMigrations(fixtureDb, [MIGRATIONS[0]]);
+    await fixtureDb.runAsync(
+      `INSERT INTO cached_posts (id, author, username, content, tip_total, timestamp, like_count, has_liked, sync_status, created_at)
+       VALUES (?, ?, ?, ?, 0, ?, 0, 0, 'synced', ?)`,
+      ["healthy", "GAUTHOR", "user", "hello", 1_700_000_000, 1_600_000_000]
+    );
+
+    await runMigrations(fixtureDb);
+
+    expect(fixtureDb.__state.cachedPosts.get("healthy")).toMatchObject({
+      timestamp: 1_700_000_000,
+    });
   });
 });

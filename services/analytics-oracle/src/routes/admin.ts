@@ -9,6 +9,13 @@
  * The endpoint is authenticated with a bearer token via the `ADMIN_SECRET`
  * environment variable. It must be set to a high-entropy random value and
  * injected via a secrets manager, never hard-coded.
+ *
+ * Success criteria: the request is only reported as successful when the
+ * secrets backend supports runtime rotation (`keystore.supportsRotation`) AND
+ * the resulting fingerprint differs from the previous one. Anything else is a
+ * non-2xx — an endpoint that reports success while doing nothing is worse than
+ * one that fails loudly, since an operator responding to a suspected key
+ * compromise would conclude the compromised key is gone (#1541).
  */
 
 import { Router, Request, Response } from "express";
@@ -60,6 +67,27 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
     }
 
     const oldFingerprint = deps.signer.fingerprint();
+
+    // #1541 — the env-backed keystore re-reads process.env, which cannot change
+    // in a running process. Reloading there is guaranteed to yield the same key,
+    // so a 200 response would report a rotation that never happened while the
+    // operator believes a compromised key has been replaced. Refuse instead.
+    if (!deps.keystore.supportsRotation) {
+      logger.error(
+        { source: deps.keystore.source, oldFingerprint },
+        "Key rotation refused: keystore backend cannot rotate"
+      );
+      res.status(400).json({
+        error: {
+          code: "ROTATION_UNSUPPORTED",
+          message:
+            "The env-backed keystore cannot be rotated at runtime: SECRETS must reference a file " +
+            `(SECRETS=file:///path/to/oracle-key.hex) to support rotation. Current source: ${deps.keystore.source}`,
+        },
+      });
+      return;
+    }
+
     let newSeed: Uint8Array;
     try {
       newSeed = deps.keystore.reload();
@@ -76,6 +104,27 @@ export function createAdminRouter(deps: AdminRouterDeps): Router {
 
     try {
       const newFingerprint = deps.signer.rotate(newSeed);
+
+      // Success criterion of this endpoint, stated explicitly: the key must
+      // actually have changed. A backend that yields the same material (stale
+      // mount, reverted secret) is a no-op rotation and must never be reported
+      // as success (#1541).
+      if (newFingerprint === oldFingerprint) {
+        logger.error(
+          { oldFingerprint, source: deps.keystore.source },
+          "Key rotation produced an unchanged fingerprint — treating as failure"
+        );
+        res.status(409).json({
+          error: {
+            code: "ROTATION_NOOP",
+            message:
+              "Reload returned the same signing key: the fingerprint is unchanged, so nothing was " +
+              "rotated. Ensure the secret backend actually holds new key material.",
+          },
+        });
+        return;
+      }
+
       deps.invalidateCache(newFingerprint);
       deps.keystore.zeroise();
 
