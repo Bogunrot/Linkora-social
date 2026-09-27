@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { parseMetadata, shouldFetchPreview, createPlaceholderPreview } from '@/lib/linkPreview';
 
-// Cache previews per domain to reduce redundant fetches
+// Cache previews keyed by normalized full URL (host + pathname + search) so
+// two different articles on the same domain get independent entries.
 const previewCache = new Map<string, { preview: any; timestamp: number }>();
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
+
+function cacheKey(rawUrl: string): string {
+  try {
+    const { host, pathname, search } = new URL(rawUrl);
+    return `${host}${pathname}${search}`;
+  } catch {
+    return rawUrl;
+  }
+}
 
 /**
  * GET /api/link-preview?url=<url>
@@ -27,9 +37,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(createPlaceholderPreview(url));
   }
 
-  // Check cache
-  const domain = new URL(url).hostname;
-  const cached = previewCache.get(domain);
+  // Check cache — keyed on the full URL so distinct pages on the same host
+  // are cached independently and a failed fetch never poisons sibling pages.
+  const key = cacheKey(url);
+  const cached = previewCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     return NextResponse.json(cached.preview);
   }
@@ -51,38 +62,30 @@ export async function GET(request: NextRequest) {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      const placeholder = createPlaceholderPreview(url);
-      previewCache.set(domain, { preview: placeholder, timestamp: Date.now() });
-      return NextResponse.json(placeholder);
+      return NextResponse.json(createPlaceholderPreview(url));
     }
 
     // Check content type
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('text/html')) {
-      const placeholder = createPlaceholderPreview(url);
-      previewCache.set(domain, { preview: placeholder, timestamp: Date.now() });
-      return NextResponse.json(placeholder);
+      return NextResponse.json(createPlaceholderPreview(url));
     }
 
     // Limit response size to 500KB
     const buffer = await response.arrayBuffer();
     if (buffer.byteLength > 500 * 1024) {
-      const placeholder = createPlaceholderPreview(url);
-      previewCache.set(domain, { preview: placeholder, timestamp: Date.now() });
-      return NextResponse.json(placeholder);
+      return NextResponse.json(createPlaceholderPreview(url));
     }
 
     const html = new TextDecoder().decode(buffer);
     const metadata = parseMetadata(html, url);
 
-    // Cache the result
-    previewCache.set(domain, { preview: metadata, timestamp: Date.now() });
+    // Only cache successful metadata — never pin a placeholder into the cache.
+    previewCache.set(key, { preview: metadata, timestamp: Date.now() });
 
     return NextResponse.json(metadata);
   } catch (err) {
     console.error(`Link preview fetch error for ${url}:`, err);
-    const placeholder = createPlaceholderPreview(url);
-    previewCache.set(domain, { preview: placeholder, timestamp: Date.now() });
-    return NextResponse.json(placeholder);
+    return NextResponse.json(createPlaceholderPreview(url));
   }
 }
