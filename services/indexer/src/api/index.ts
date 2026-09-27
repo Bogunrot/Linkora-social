@@ -29,6 +29,7 @@ import {
 import { PostgresDatabase } from "../postgres-db";
 import { HealthMonitor } from "../services/health-monitor";
 import { metricsText } from "../metrics";
+import { attachPoolMonitoring } from "../db-pool-monitor";
 
 let warnedMissingAllowedOrigins = false;
 
@@ -286,9 +287,21 @@ if (require.main === module) {
   const _stub = new Pool({ connectionString: DATABASE_URL }) as unknown as Database;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { loadConfig } = require("../config");
-  const PORT = loadConfig().port;
+  const config = loadConfig();
+  const PORT = config.port;
   const databaseUrl = process.env.DATABASE_URL;
-  const pg = databaseUrl ? new PgPool({ connectionString: databaseUrl }) : undefined;
+  // Same pool settings and monitoring as the main indexer process (issue
+  // #888): this API process holds its own pool, so it needs its own
+  // 'error' listener and configured limits, not just the ingestion pool's.
+  const pg = databaseUrl
+    ? new PgPool({
+        connectionString: databaseUrl,
+        max: config.dbPool.max,
+        idleTimeoutMillis: config.dbPool.idleTimeoutMs,
+        connectionTimeoutMillis: config.dbPool.connectionTimeoutMs,
+      })
+    : undefined;
+  if (pg) attachPoolMonitoring(pg, { logger, serviceName: "indexer-api" });
   const apiApp = pg
     ? createApp(new PostgresDatabase(pg), pg, undefined, undefined, loadConfig().mediaUpload)
     : createApp(_stub);
