@@ -6,6 +6,14 @@ import { Pool } from "pg";
 import fs from "fs";
 import path from "path";
 import { logger } from "./logger";
+import {
+  attachPoolMonitoring,
+  checkPoolHealth,
+  getPoolMetrics,
+  type PoolMetrics,
+  type PoolHealthResult,
+} from "./db-pool-monitor";
+import { optionalInt } from "./config";
 
 export interface DbMessage {
   id: string;
@@ -55,12 +63,31 @@ class Database {
   private pool: Pool;
 
   constructor(connectionString: string) {
+    // Tunable via env (issue #888); defaults match the pre-existing values.
     this.pool = new Pool({
       connectionString,
-      max: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
+      max: optionalInt("DB_POOL_MAX", 20),
+      idleTimeoutMillis: optionalInt("DB_POOL_IDLE_TIMEOUT_MS", 30000),
+      connectionTimeoutMillis: optionalInt("DB_POOL_CONNECTION_TIMEOUT_MS", 2000),
     });
+    // pool.on('error') is required: without it, an idle client that dies
+    // (e.g. Postgres restarting underneath it) crashes the process instead
+    // of being logged and discarded.
+    attachPoolMonitoring(this.pool, {
+      logger,
+      serviceName: "dm-relay",
+      statsIntervalMs: optionalInt("DB_POOL_STATS_INTERVAL_MS", 0),
+    });
+  }
+
+  /** Current pool utilisation (active, idle, waiting) — issue #888. */
+  getPoolMetrics(): PoolMetrics {
+    return getPoolMetrics(this.pool);
+  }
+
+  /** Proactive `SELECT 1` health check, distinct from metrics — issue #888. */
+  async getPoolHealth(): Promise<PoolHealthResult> {
+    return checkPoolHealth(this.pool);
   }
 
   async init(): Promise<void> {
@@ -212,6 +239,24 @@ class Database {
   }
 
   /**
+   * Whether `address` is a sender or recipient of any message in
+   * `conversationId` (issue #1331).
+   *
+   * `conversation_id` is a deterministic hash of the two participant
+   * addresses, so it does not itself prove who they are; this checks
+   * membership against the actual message rows before a caller is allowed to
+   * read a conversation's metadata. A conversation with no messages yet has
+   * no rows to match, so it returns `false` — nobody can prove membership of
+   * an empty conversation, and there is nothing in it to protect either way.
+   */
+  async isConversationParticipant(conversationId: string, address: string): Promise<boolean> {
+    const query =
+      "SELECT 1 FROM dm_messages WHERE conversation_id = $1 AND (sender = $2 OR recipient = $2) LIMIT 1";
+    const result = await this.pool.query(query, [conversationId, address]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /**
    * Delete every message older than `ttlDays`, in bounded batches.
    *
    * Each statement removes at most `batchSize` rows (oldest first, matching
@@ -353,11 +398,7 @@ class Database {
       FROM message_idempotency
       WHERE sender_address = $1 AND idempotency_key = $2 AND response_status <> $3
     `;
-    const result = await this.pool.query(query, [
-      senderAddress,
-      key,
-      IDEMPOTENCY_PENDING_STATUS,
-    ]);
+    const result = await this.pool.query(query, [senderAddress, key, IDEMPOTENCY_PENDING_STATUS]);
     if (result.rowCount === 0) return null;
 
     return {
