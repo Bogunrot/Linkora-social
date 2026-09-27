@@ -161,8 +161,11 @@ export function CreatePostModal({ isOpen, onClose, onSubmit, author }: CreatePos
   }, [isOpen, handleSubmit]);
 
   const isPostDisabled =
-    (!content.trim() && images.length === 0) || isSubmitting || isCompressing || hasIncompleteMedia;
-    (!content.trim() && images.length === 0) || isSubmitting || isCompressing || isOverLimit;
+    (!content.trim() && images.length === 0) ||
+    isSubmitting ||
+    isCompressing ||
+    hasIncompleteMedia ||
+    isOverLimit;
 
   return (
     <Dialog.Root open={isOpen} onOpenChange={(open) => !open && onClose()}>

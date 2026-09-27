@@ -109,9 +109,6 @@ async function createApp() {
   app.use(requestIdMiddleware);
   app.use(requestLoggerMiddleware);
 
-  // Rate limiting (before content-type validation so malformed requests are metered)
-  app.use("/api", rateLimitMiddleware);
-
   app.use(validateContentType);
 
   // API routes. Auth (message-signature for POST /messages, address-ownership

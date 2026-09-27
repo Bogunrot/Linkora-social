@@ -3,6 +3,7 @@ import { WebSocket } from "ws";
 import { Database, DbMessage } from "./database";
 import { AuthService } from "./auth";
 import { messageAuthMiddleware, addressOwnershipMiddleware } from "./middleware/auth";
+import { rateLimitMiddleware } from "./middleware/rateLimit";
 import { validateBody, validateQuery, validateParams } from "./middleware/validate";
 import {
   getSendMessageSchema,
@@ -220,6 +221,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
   router.post(
     "/messages",
     messageAuth,
+    rateLimitMiddleware, // runs after auth so req.stellarAddress is set → uses authLimiter
     validateBody(getSendMessageSchema()),
     idempotencyMiddleware(database),
     async (req: Request, res: Response) => {
@@ -271,6 +273,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
   router.get(
     "/messages/:address",
     addressAuth,
+    rateLimitMiddleware,
     validateParams(AddressParamSchema),
     validateQuery(GetMessagesQuerySchema),
     async (req: Request, res: Response) => {
@@ -323,6 +326,7 @@ export function createRouter(database: Database, authService: AuthService): Rout
 
   router.get(
     "/messages/conversation/:conversationId",
+    rateLimitMiddleware,
     validateParams(ConversationIdParamSchema),
     validateQuery(GetMessagesQuerySchema),
     async (req: Request, res: Response) => {
