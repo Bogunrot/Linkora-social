@@ -90,9 +90,44 @@ export function createBridge(options: BridgeOptions) {
 
 export type LinkoraSDK = ReturnType<typeof createBridge>;
 import { assertPermission, BridgeError, BridgePermission } from "./permissions";
-import { getWalletAddress, getItem, StorageKey } from "../utils/secureStorage";
+import { getWalletAddress } from "../utils/secureStorage";
 
 type BridgeHandler = (payload?: unknown) => Promise<unknown> | unknown;
+
+// #1554 — property names whose values must never cross the bridge boundary in
+// any direction. Matched case-insensitively after stripping `_` and `-`, so
+// `authToken`, `auth_token` and `AUTH-TOKEN` are all covered. A mini app
+// holding `profile.read` must not be able to walk away with a bearer
+// credential; the host's own handlers are re-checked here too so a handler
+// that returns a token by accident still cannot leak it.
+const SECRET_KEY_PATTERN =
+  /^(token|authtoken|accesstoken|refreshtoken|idtoken|sessiontoken|creatortoken|bearer|authorization|apikey|apisecret|secret|password|passphrase|privatekey|seedkey|seedphrase|mnemonic|jwt|cookie)$/;
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key.toLowerCase().replace(/[-_]/g, ""));
+}
+
+/**
+ * Recursively drops secret-looking properties from a value on its way out of
+ * the bridge. Arrays and plain objects are walked; primitives pass through.
+ */
+export function redactBridgeSecrets<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactBridgeSecrets(entry)) as unknown as T;
+  }
+
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const redacted: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(source)) {
+      if (isSecretKey(key)) continue;
+      redacted[key] = redactBridgeSecrets(entry);
+    }
+    return redacted as unknown as T;
+  }
+
+  return value;
+}
 
 export interface MiniAppBridgeOptions {
   permissions: BridgePermission[];
@@ -147,8 +182,13 @@ const DEFAULT_HANDLERS: Partial<Record<BridgePermission, BridgeHandler>> = {
     if (!address) {
       return null;
     }
-    const creatorToken = await getItem<string>(StorageKey.AuthToken).catch(() => null);
-    return { address, username: null, creatorToken };
+    // #1554 — the response carries the public address and nothing else. It
+    // must never contain a bearer credential: a mini app holding only
+    // `profile.read` would otherwise be able to call the indexer as the user
+    // and read/write anything the user can. `creatorToken` used to be read
+    // from the keychain and returned here, which handed the app's auth token
+    // to the least-privileged permission in the model.
+    return { address, username: null };
   },
   "profile.update": async (payload) => payload,
 };
@@ -195,7 +235,7 @@ export function createMiniAppBridge({
         throw new BridgeError("MethodUnavailable", `No handler registered for ${method}`);
       }
 
-      return handler(payload);
+      return redactBridgeSecrets(await handler(payload));
     },
   };
 }
