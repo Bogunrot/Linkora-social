@@ -1,58 +1,63 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 
 import {
-  addPoolAdmin,
   isValidStellarAddress,
   normalizeAddress,
-  removePoolAdmin,
-  updatePoolThreshold,
+  refreshPoolFromIndexer,
   usePoolRecord,
+  type PoolApproval,
 } from "../../../utils/poolStore";
 import { useWallet } from "../../../hooks/useWallet";
+import { useSubmitTx } from "../../../hooks/useSubmitTx";
 
-type PendingAction =
-  | {
-      kind: "add";
-      value: string;
-      approvals: string[];
-    }
-  | {
-      kind: "remove";
-      value: string;
-      approvals: string[];
-    }
-  | {
-      kind: "threshold";
-      value: string;
-      approvals: string[];
-    };
+type PendingActionKind = "add" | "remove" | "threshold";
+
+interface PendingAction {
+  kind: PendingActionKind;
+  value: string;
+  /**
+   * #1557 — wallet signatures collected for this action. An entry can only be
+   * added by the connected admin signing it on-chain, so the threshold cannot
+   * be met by a non-admin (or by a client that edits local state).
+   */
+  approvals: PoolApproval[];
+}
 
 export default function PoolAdminsScreen(): JSX.Element {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
   const poolId = Array.isArray(id) ? id[0] : (id ?? "");
   const pool = usePoolRecord(poolId);
-  const { address } = useWallet();
+  const { address, connected } = useWallet();
+  const submitTx = useSubmitTx();
   const connectedAddress = address ? normalizeAddress(address) : null;
-  const connectedIsAdmin = Boolean(connectedAddress && pool.admins.includes(connectedAddress));
+  // Fail closed: an unknown wallet is never an admin.
+  const connectedIsAdmin = Boolean(
+    connected && connectedAddress && pool.admins.includes(connectedAddress)
+  );
 
   const [adminAddress, setAdminAddress] = useState("");
-  const [thresholdInput, setThresholdInput] = useState(String(pool.threshold));
+  const [thresholdInput, setThresholdInput] = useState("2");
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const pendingApprovals = useMemo(() => pendingAction?.approvals ?? [], [pendingAction]);
-  const canExecute = Boolean(pendingAction) && pendingApprovals.length >= pool.threshold;
+  // #1557 — the admin set and threshold are read from the indexer (which
+  // mirrors the contract), never authored locally.
+  useEffect(() => {
+    refreshPoolFromIndexer(poolId).catch(() => {
+      setMessage("Could not load pool admins from the indexer.");
+    });
+  }, [poolId, pool.source]);
 
-  const signerSummary = useMemo(
-    () =>
-      pool.admins.map((admin) => ({
-        address: admin,
-        approved: pendingApprovals.includes(admin),
-      })),
-    [pendingApprovals, pool.admins]
+  const pendingApprovals = pendingAction?.approvals ?? [];
+  const canExecute = Boolean(
+    pendingAction &&
+    connectedIsAdmin &&
+    pool.threshold >= 1 &&
+    pendingApprovals.length >= pool.threshold
   );
 
   const queueAction = (action: PendingAction) => {
@@ -60,73 +65,67 @@ export default function PoolAdminsScreen(): JSX.Element {
     setPendingAction(action);
   };
 
-  const signPendingAction = () => {
+  /**
+   * #1557 — the only way to add an approval. The connected admin signs an
+   * approval transaction with their own wallet; there is no per-admin toggle
+   * to click on someone else's behalf.
+   */
+  const signPendingAction = async () => {
     if (!connectedAddress || !connectedIsAdmin || !pendingAction) {
       return;
     }
 
-    setPendingAction((current) => {
-      if (!current) {
-        return current;
-      }
+    setBusy(true);
+    setMessage(null);
 
-      const approvals = current.approvals.includes(connectedAddress)
-        ? current.approvals.filter((admin) => admin !== connectedAddress)
-        : [...current.approvals, connectedAddress];
-
-      return { ...current, approvals };
-    });
-  };
-
-  const toggleSigner = (signerAddress: string) => {
-    if (!pendingAction) {
-      return;
-    }
-
-    setPendingAction((current) => {
-      if (!current) {
-        return current;
-      }
-
-      const normalized = normalizeAddress(signerAddress);
-
-      if (!pool.admins.includes(normalized)) {
-        return current;
-      }
-
-      const approvals = current.approvals.includes(normalized)
-        ? current.approvals.filter((admin) => admin !== normalized)
-        : [...current.approvals, normalized];
-
-      return { ...current, approvals };
-    });
-  };
-
-  const executePendingAction = () => {
-    if (!pendingAction || !canExecute) {
-      setMessage("Collect enough approvals before applying the change.");
-      return;
-    }
-
-    if (pendingAction.kind === "add") {
-      const changed = addPoolAdmin(poolId, pendingAction.value);
-      setMessage(changed ? "Admin added." : "That admin is already present or invalid.");
-    }
-
-    if (pendingAction.kind === "remove") {
-      const changed = removePoolAdmin(poolId, pendingAction.value);
-      setMessage(changed ? "Admin removed." : "Unable to remove the selected admin.");
-    }
-
-    if (pendingAction.kind === "threshold") {
-      const nextThreshold = Number(pendingAction.value);
-      const changed = updatePoolThreshold(poolId, nextThreshold);
-      setMessage(
-        changed ? "Threshold updated." : "Threshold must be between 1 and the admin count."
+    try {
+      const signature = await submitTx(
+        `pool_admin_change_approve:${poolId}:${pendingAction.kind}:${pendingAction.value}:${connectedAddress}`
       );
+
+      setPendingAction((current) =>
+        current
+          ? {
+              ...current,
+              approvals: [
+                ...current.approvals.filter((approval) => approval.address !== connectedAddress),
+                { address: connectedAddress, signature, signedAt: Date.now() },
+              ],
+            }
+          : current
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Approval was not signed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const executePendingAction = async () => {
+    if (!pendingAction || !canExecute) {
+      setMessage("Collect enough admin signatures before applying the change.");
+      return;
     }
 
-    setPendingAction(null);
+    setBusy(true);
+    setMessage(null);
+
+    try {
+      // #1557 — the contract receives the action plus the threshold set of
+      // signatures and is the only thing that decides whether it applies.
+      await submitTx(
+        `pool_admin_change:${poolId}:${pendingAction.kind}:${pendingAction.value}:${pendingApprovals
+          .map((approval) => `${approval.address}=${approval.signature}`)
+          .join(",")}`
+      );
+      setMessage("Change submitted. The contract has the final say.");
+      setPendingAction(null);
+      await refreshPoolFromIndexer(poolId).catch(() => undefined);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The contract rejected the change.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const queueAddAdmin = () => {
@@ -257,38 +256,51 @@ export default function PoolAdminsScreen(): JSX.Element {
             <Text style={styles.pendingValue}>{pendingAction.value}</Text>
 
             <View style={styles.signerList}>
-              {signerSummary.map((signer) => (
-                <Pressable
-                  key={signer.address}
-                  onPress={() => toggleSigner(signer.address)}
+              {pool.admins.map((admin) => (
+                <View
+                  key={admin}
                   style={styles.signerRow}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Toggle approval for ${signer.address}`}
+                  accessibilityLabel={`Approval status for ${admin}`}
                 >
                   <Text style={styles.signerAddress}>
-                    {signer.address.slice(0, 8)}...{signer.address.slice(-6)}
+                    {admin.slice(0, 8)}...{admin.slice(-6)}
                   </Text>
-                  <Text style={signer.approved ? styles.approved : styles.pending}>
-                    {signer.approved ? "Signed" : "Pending"}
+                  <Text
+                    style={
+                      pendingApprovals.some((approval) => approval.address === admin)
+                        ? styles.approved
+                        : styles.pending
+                    }
+                  >
+                    {pendingApprovals.some((approval) => approval.address === admin)
+                      ? "Signed"
+                      : "Pending"}
                   </Text>
-                </Pressable>
+                </View>
               ))}
             </View>
 
             <View style={styles.buttonStack}>
               <Pressable
-                style={[styles.primaryButton, !connectedIsAdmin ? styles.buttonDisabled : null]}
+                style={[
+                  styles.primaryButton,
+                  !connectedIsAdmin || busy ? styles.buttonDisabled : null,
+                ]}
                 onPress={signPendingAction}
-                disabled={!connectedIsAdmin}
+                disabled={!connectedIsAdmin || busy}
               >
                 <Text style={styles.primaryButtonText}>
-                  {connectedIsAdmin ? "Sign with connected admin" : "Connected wallet not admin"}
+                  {connectedIsAdmin
+                    ? busy
+                      ? "Waiting for signature..."
+                      : "Sign with connected admin"
+                    : "Connected wallet not admin"}
                 </Text>
               </Pressable>
               <Pressable
-                style={[styles.primaryButton, !canExecute ? styles.buttonDisabled : null]}
+                style={[styles.primaryButton, !canExecute || busy ? styles.buttonDisabled : null]}
                 onPress={executePendingAction}
-                disabled={!canExecute}
+                disabled={!canExecute || busy}
               >
                 <Text style={styles.primaryButtonText}>Apply change</Text>
               </Pressable>
