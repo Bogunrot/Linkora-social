@@ -242,3 +242,123 @@ describe("WalletContext session persistence (#1593)", () => {
     expect(await getConnectionState()).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #1196 — no state updates on unmounted components
+// ---------------------------------------------------------------------------
+
+describe("WalletContext listener / unmount safety (#1196)", () => {
+  beforeEach(() => {
+    mockSecureStore.clear();
+    delete (globalThis as { __LINKORA_WALLET_KIT__?: unknown }).__LINKORA_WALLET_KIT__;
+    delete (globalThis as { __LINKORA_FREIGHTER_API__?: unknown }).__LINKORA_FREIGHTER_API__;
+  });
+
+  it("does not update state after unmounting mid-checkConnectionState", async () => {
+    // Seed a freighter session so checkConnectionState has something to do.
+    await seedSession("freighter");
+
+    // Slow down the freighter probe so the component can unmount before it finishes.
+    let resolveProbe!: () => void;
+    const probePromise = new Promise<void>((res) => {
+      resolveProbe = res;
+    });
+
+    globalThis.__LINKORA_FREIGHTER_API__ = {
+      isConnected: jest.fn(async () => {
+        await probePromise;
+        return true;
+      }),
+      getPublicKey: jest.fn(async () => ADDRESS),
+    };
+
+    const spy = jest.spyOn(console, "error");
+
+    const { unmount, result } = renderWallet();
+
+    // Still loading — unmount immediately before the probe resolves.
+    expect(result.current.state).toBe("loading");
+    unmount();
+
+    // Now let the probe finish — state setters should not fire.
+    await act(async () => {
+      resolveProbe();
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    // No "Can't perform a React state update on an unmounted component" warning.
+    expect(spy).not.toHaveBeenCalledWith(
+      expect.stringContaining("unmounted")
+    );
+    spy.mockRestore();
+  });
+
+  it("does not update state after unmounting mid-connect", async () => {
+    // A very slow requestFreighterAddress call.
+    let resolveConnect!: () => void;
+    const connectPromise = new Promise<void>((res) => {
+      resolveConnect = res;
+    });
+
+    globalThis.__LINKORA_FREIGHTER_API__ = makeFreighter({
+      requestAccess: jest.fn(async () => {
+        await connectPromise;
+        return { address: ADDRESS };
+      }),
+    });
+
+    const spy = jest.spyOn(console, "error");
+
+    const { unmount, result } = renderWallet();
+    await waitFor(() => expect(result.current.state).toBe("disconnected"));
+
+    // Start the connect without awaiting.
+    let connectDone = false;
+    act(() => {
+      result.current.connect("freighter").finally(() => {
+        connectDone = true;
+      });
+    });
+
+    // Component transitions to "connecting" — then we unmount.
+    await waitFor(() => expect(result.current.state).toBe("connecting"));
+    unmount();
+
+    // Resolve the slow requestAccess.
+    await act(async () => {
+      resolveConnect();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+
+    expect(connectDone).toBe(true);
+    expect(spy).not.toHaveBeenCalledWith(
+      expect.stringContaining("unmounted")
+    );
+    spy.mockRestore();
+  });
+
+  it("does not accumulate listeners across repeated mount/unmount cycles", async () => {
+    globalThis.__LINKORA_FREIGHTER_API__ = makeFreighter();
+    await seedSession("freighter");
+
+    const callCounts: number[] = [];
+
+    for (let i = 0; i < 5; i++) {
+      const { unmount } = renderWallet();
+      // Small delay to let effects fire.
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+      });
+      unmount();
+    }
+
+    const freighter = globalThis.__LINKORA_FREIGHTER_API__ as unknown as ReturnType<
+      typeof makeFreighter
+    >;
+
+    // isConnected should not have been called more times than the number of mounts
+    // (one call per mount cycle — not accumulating).
+    callCounts.push((freighter.isConnected as jest.Mock).mock.calls.length);
+    expect(callCounts[0]).toBeLessThanOrEqual(5);
+  });
+});
