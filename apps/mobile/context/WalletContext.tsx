@@ -464,91 +464,94 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
     [walletKit]
   );
 
-  const checkConnectionState = useCallback(async (signal?: AbortSignal) => {
-    try {
-      if (signal?.aborted) return;
-      setState("loading");
-      setError(null);
-
-      const [storedAddress, storedConn] = await Promise.all([
-        getWalletAddress(),
-        getConnectionState(),
-      ]);
-
-      if (signal?.aborted) return;
-
-      if (!storedAddress || !storedConn || !storedConn.connected) {
-        setWallet(EMPTY_WALLET);
-        setState("disconnected");
-        return;
-      }
-
-      // Corrupt/legacy address: nothing to restore, and it is genuinely invalid.
-      if (!isStellarAddress(storedAddress)) {
-        await clearStoredSession();
+  const checkConnectionState = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
         if (signal?.aborted) return;
-        setWallet(EMPTY_WALLET);
-        setState("disconnected");
-        return;
-      }
+        setState("loading");
+        setError(null);
 
-      // Prefer the adapter recorded in the session; sessions written before
-      // #1593 have no provider, so probe both (cheapest/most likely first).
-      const candidates: WalletProviderKind[] = storedConn.provider
-        ? [storedConn.provider]
-        : ["freighter", "walletconnect"];
+        const [storedAddress, storedConn] = await Promise.all([
+          getWalletAddress(),
+          getConnectionState(),
+        ]);
 
-      const results: Array<{ provider: WalletProviderKind; probe: SessionProbe }> = [];
-      for (const candidate of candidates) {
         if (signal?.aborted) return;
-        const probe =
-          candidate === "freighter"
-            ? await probeFreighterSession(storedAddress)
-            : await probeWalletConnectSession(storedAddress);
-        results.push({ provider: candidate, probe });
-        if (probe.status === "restored") break;
-      }
 
-      if (signal?.aborted) return;
-
-      const match = results.find((result) => result.probe.status === "restored");
-      if (match && match.probe.status === "restored") {
-        const { address } = match.probe;
-        // A legacy record has no provider; record the one that matched so the
-        // next cold start probes it directly (and not the other adapter).
-        if (storedConn.provider !== match.provider) {
-          await persistSession(address, match.provider);
+        if (!storedAddress || !storedConn || !storedConn.connected) {
+          setWallet(EMPTY_WALLET);
+          setState("disconnected");
+          return;
         }
+
+        // Corrupt/legacy address: nothing to restore, and it is genuinely invalid.
+        if (!isStellarAddress(storedAddress)) {
+          await clearStoredSession();
+          if (signal?.aborted) return;
+          setWallet(EMPTY_WALLET);
+          setState("disconnected");
+          return;
+        }
+
+        // Prefer the adapter recorded in the session; sessions written before
+        // #1593 have no provider, so probe both (cheapest/most likely first).
+        const candidates: WalletProviderKind[] = storedConn.provider
+          ? [storedConn.provider]
+          : ["freighter", "walletconnect"];
+
+        const results: Array<{ provider: WalletProviderKind; probe: SessionProbe }> = [];
+        for (const candidate of candidates) {
+          if (signal?.aborted) return;
+          const probe =
+            candidate === "freighter"
+              ? await probeFreighterSession(storedAddress)
+              : await probeWalletConnectSession(storedAddress);
+          results.push({ provider: candidate, probe });
+          if (probe.status === "restored") break;
+        }
+
         if (signal?.aborted) return;
-        setWallet({
-          address,
-          network: isKnownNetwork(storedConn.network)
-            ? storedConn.network
-            : selectedNetworkIdRef.current,
-          provider: match.provider,
-        });
-        setState("connected");
-        return;
+
+        const match = results.find((result) => result.probe.status === "restored");
+        if (match && match.probe.status === "restored") {
+          const { address } = match.probe;
+          // A legacy record has no provider; record the one that matched so the
+          // next cold start probes it directly (and not the other adapter).
+          if (storedConn.provider !== match.provider) {
+            await persistSession(address, match.provider);
+          }
+          if (signal?.aborted) return;
+          setWallet({
+            address,
+            network: isKnownNetwork(storedConn.network)
+              ? storedConn.network
+              : selectedNetworkIdRef.current,
+            provider: match.provider,
+          });
+          setState("connected");
+          return;
+        }
+
+        // Only delete when every adapter we could ask said the session is gone.
+        // An "unverifiable" adapter means we simply could not tell yet.
+        const anyInvalid = results.some((result) => result.probe.status === "invalid");
+        const anyUnverifiable = results.some((result) => result.probe.status === "unverifiable");
+        if (anyInvalid && !anyUnverifiable) {
+          await clearStoredSession();
+        }
+
+        if (signal?.aborted) return;
+
+        setWallet(EMPTY_WALLET);
+        setState("disconnected");
+      } catch (err) {
+        if (signal?.aborted) return;
+        setState("error");
+        setError(err instanceof Error ? err.message : "Unknown error");
       }
-
-      // Only delete when every adapter we could ask said the session is gone.
-      // An "unverifiable" adapter means we simply could not tell yet.
-      const anyInvalid = results.some((result) => result.probe.status === "invalid");
-      const anyUnverifiable = results.some((result) => result.probe.status === "unverifiable");
-      if (anyInvalid && !anyUnverifiable) {
-        await clearStoredSession();
-      }
-
-      if (signal?.aborted) return;
-
-      setWallet(EMPTY_WALLET);
-      setState("disconnected");
-    } catch (err) {
-      if (signal?.aborted) return;
-      setState("error");
-      setError(err instanceof Error ? err.message : "Unknown error");
-    }
-  }, [clearStoredSession, persistSession, probeFreighterSession, probeWalletConnectSession]);
+    },
+    [clearStoredSession, persistSession, probeFreighterSession, probeWalletConnectSession]
+  );
 
   // #1593 — run the restore on mount even before the WalletConnect kit is ready;
   // a Freighter session does not depend on it, and a WalletConnect session is
@@ -562,12 +565,22 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
     };
   }, [checkConnectionState]);
 
+  // #1196 — guard all post-await state setters so that unmounting mid-connect
+  // does not cause state updates on an unmounted component. This must be a ref
+  // tied to the effect lifecycle: an async callback cannot return a cleanup
+  // function, so a local `mounted` flag was never set to false and the guard
+  // silently always passed.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const connect = useCallback(
     async (provider: WalletProviderKind = "walletconnect") => {
-      // #1196 — guard all post-await state setters so that unmounting mid-connect
-      // does not cause state updates on an unmounted component.
-      let mounted = true;
-      const guard = () => mounted;
+      const guard = () => mountedRef.current;
 
       try {
         setState("connecting");
@@ -607,10 +620,6 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         setError(err instanceof Error ? err.message : "Connection failed");
         setWallet(EMPTY_WALLET);
       }
-
-      return () => {
-        mounted = false;
-      };
     },
     [persistSession, requestFreighterAddress, selectedNetwork, walletKit]
   );

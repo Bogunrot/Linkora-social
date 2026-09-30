@@ -115,7 +115,7 @@ export default function PoolsDetailScreen(): JSX.Element {
             accessibilityState={{ selected: activeTab === tab }}
           >
             <Text style={[styles.tabText, activeTab === tab && styles.tabTextActive]}>
-              {tab[0].toUpperCase() + tab.slice(1)}
+              {tab.charAt(0).toUpperCase() + tab.slice(1)}
             </Text>
           </Pressable>
         ))}

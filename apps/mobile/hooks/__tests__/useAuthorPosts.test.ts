@@ -114,9 +114,12 @@ describe("useAuthorPosts (#1595)", () => {
   it("resets and reloads when the author changes", async () => {
     mockedFetchAuthorPosts.mockResolvedValue([makePost("1")]);
 
-    const { result, rerender } = renderHook(({ author }) => useAuthorPosts(author), {
-      initialProps: { author: "GONE" },
-    });
+    const { result, rerender } = renderHook(
+      ({ author }: { author: string }) => useAuthorPosts(author),
+      {
+        initialProps: { author: "GONE" },
+      }
+    );
     await waitFor(() => expect(result.current.posts).toHaveLength(1));
 
     mockedFetchAuthorPosts.mockResolvedValue([makePost("2")]);
@@ -137,9 +140,12 @@ describe("useAuthorPosts (#1595)", () => {
       )
       .mockResolvedValueOnce([makePost("2")]);
 
-    const { result, rerender } = renderHook(({ author }) => useAuthorPosts(author), {
-      initialProps: { author: "GONE" },
-    });
+    const { result, rerender } = renderHook(
+      ({ author }: { author: string }) => useAuthorPosts(author),
+      {
+        initialProps: { author: "GONE" },
+      }
+    );
 
     // Switch authors while the first request is still in flight.
     rerender({ author: "GTWO" });
