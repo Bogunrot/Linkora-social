@@ -1,10 +1,32 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "tasks": {
-    "build": { "outputs": ["dist/**", "target/**"] },
-    "dev": { "persistent": true, "cache": false },
-    "lint": {},
-    "test": {},
-    "format": {}
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "target/**", ".next/**", ".expo/**"]
+    },
+    "dev": { 
+      "persistent": true, 
+      "cache": false 
+    },
+    "lint": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "check:bundle": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test:integration": {
+      "cache": false
+    },
+    "typecheck": {
+      "cache": false
+    },
+    "format": {
+      "outputs": []
+    }
   }
 }
