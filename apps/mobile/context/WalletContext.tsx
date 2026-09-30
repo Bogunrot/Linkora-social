@@ -3,6 +3,7 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useCallback,
   ReactNode,
@@ -267,25 +268,33 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
     () => globalThis.__LINKORA_WALLET_KIT__ ?? null
   );
 
-  // #1593 — the wallet's network is the network the session was established on,
-  // falling back to the currently selected one. It used to be independent state
-  // seeded with a hardcoded "TESTNET", so it disagreed with the session it
-  // belonged to.
-  const network: WalletNetwork = wallet.network ?? selectedNetwork.id;
+  // #1593 — a Stellar keypair is valid on any network, so a connected wallet
+  // operates on the network the app currently has selected. `network` used to be
+  // standalone state seeded with a hardcoded "TESTNET", so every consumer
+  // showing it went stale the moment the user switched networks in settings.
+  // The session's origin network stays on `wallet.network` (and in storage) as
+  // provenance for the persisted record.
+  const network: WalletNetwork = selectedNetwork.id;
 
-  const persistSession = useCallback(
-    async (address: string, provider: WalletProviderKind) => {
-      const connState: StoredConnectionState = {
-        connected: true,
-        address,
-        provider,
-        network: selectedNetwork.id,
-        timestamp: Date.now(),
-      };
-      await Promise.all([setWalletAddress(address), setConnectionState(connState)]);
-    },
-    [selectedNetwork.id]
-  );
+  // Read the selected network through a ref so switching networks does not
+  // re-run the restore below. A session is network-independent, and re-probing
+  // on every switch flashed "loading" and could drop an already-connected user
+  // whose adapter was momentarily unreachable.
+  const selectedNetworkIdRef = useRef(selectedNetwork.id);
+  useEffect(() => {
+    selectedNetworkIdRef.current = selectedNetwork.id;
+  });
+
+  const persistSession = useCallback(async (address: string, provider: WalletProviderKind) => {
+    const connState: StoredConnectionState = {
+      connected: true,
+      address,
+      provider,
+      network: selectedNetworkIdRef.current,
+      timestamp: Date.now(),
+    };
+    await Promise.all([setWalletAddress(address), setConnectionState(connState)]);
+  }, []);
 
   const clearStoredSession = useCallback(async () => {
     await Promise.all([deleteWalletAddress(), deleteConnectionState()]);
@@ -513,7 +522,9 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         if (signal?.aborted) return;
         setWallet({
           address,
-          network: isKnownNetwork(storedConn.network) ? storedConn.network : selectedNetwork.id,
+          network: isKnownNetwork(storedConn.network)
+            ? storedConn.network
+            : selectedNetworkIdRef.current,
           provider: match.provider,
         });
         setState("connected");
@@ -537,13 +548,7 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
       setState("error");
       setError(err instanceof Error ? err.message : "Unknown error");
     }
-  }, [
-    clearStoredSession,
-    persistSession,
-    probeFreighterSession,
-    probeWalletConnectSession,
-    selectedNetwork.id,
-  ]);
+  }, [clearStoredSession, persistSession, probeFreighterSession, probeWalletConnectSession]);
 
   // #1593 — run the restore on mount even before the WalletConnect kit is ready;
   // a Freighter session does not depend on it, and a WalletConnect session is
