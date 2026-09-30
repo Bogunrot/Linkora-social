@@ -33,10 +33,23 @@ function assertGenericKey(key: string): void {
   }
 }
 
+export type StoredWalletProvider = "freighter" | "walletconnect";
+
 export interface ConnectionState {
   connected: boolean;
   address: string;
   timestamp: number;
+  /**
+   * #1593 — the adapter the session was established with. Without this the
+   * restore path had to assume WalletConnect, so a Freighter session was
+   * written on connect and deleted on the next cold start.
+   *
+   * Optional only for sessions persisted before this field existed; the
+   * restore path migrates those by probing the providers.
+   */
+  provider?: StoredWalletProvider;
+  /** #1593 — the network the session was established on. */
+  network?: string;
 }
 
 async function setItem(key: string, value: unknown): Promise<void> {
