@@ -161,7 +161,7 @@ export default function FeedPage() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [cursor, setCursor] = useState<string | number | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
 
@@ -211,25 +211,29 @@ export default function FeedPage() {
   /* ── Fetch Posts Logic ──────────────────────────────────────────────── */
 
   const fetchExploreFeed = useCallback(
-    async (cursorParam: string | number | null, append = false) => {
+    async (cursorParam: string | null, append = false) => {
       try {
         if (!append) setLoading(true);
         else setLoadingMore(true);
 
-        const cursorQuery = cursorParam !== null ? `&cursor=${encodeURIComponent(cursorParam)}` : "";
+        const cursorQuery =
+          cursorParam !== null ? `&cursor=${encodeURIComponent(cursorParam)}` : "";
         const res = await fetch(`${indexerUrl}/api/posts?limit=${PAGE_SIZE}${cursorQuery}`);
         if (!res.ok) throw new Error("Failed to fetch explore posts");
 
         const data = await res.json();
         const fetchedPosts: Post[] = data.posts ?? [];
-        const serverHasMore = data.has_more ?? false;
-        const nextCursor = data.next_cursor ?? null;
+        const serverHasMore: boolean = data.has_more ?? false;
+        // Coerce next_cursor to string|null at the fetch boundary (indexer returns string | undefined)
+        const nextCursor: string | null =
+          data.next_cursor != null ? String(data.next_cursor) : null;
 
         setPosts((prev) => (append ? [...prev, ...fetchedPosts] : fetchedPosts));
-        setHasMore(data.has_more ?? false);
+        setHasMore(serverHasMore);
+        if (nextCursor !== null) setCursor(nextCursor);
 
         const newPosts = append ? [...posts, ...fetchedPosts] : fetchedPosts;
-        persistFeed({ posts: newPosts, cursor: cursorParam, hasMore: data.has_more ?? false });
+        persistFeed({ posts: newPosts, cursor: nextCursor, hasMore: serverHasMore });
 
         // Reconcile optimistic state against the fresh server response (#1203)
         OptimisticStore.reconcileFeed(currentUserAddress, newPosts);
@@ -255,41 +259,18 @@ export default function FeedPage() {
         if (!append) setLoading(true);
         else setLoadingMore(true);
 
-        const cursorQuery = cursorParam !== null ? `&cursor=${encodeURIComponent(cursorParam)}` : "";
+        const cursorQuery =
+          cursorParam !== null ? `&cursor=${encodeURIComponent(String(cursorParam))}` : "";
         const res = await fetch(
           `${indexerUrl}/api/feed/following/${currentUserAddress}?limit=${PAGE_SIZE}${cursorQuery}`
         );
-        if (!followingRes.ok) throw new Error("Failed to fetch following graph");
-        const followingData = await followingRes.json();
-        const followingList: string[] = followingData.following ?? [];
-
-        if (followingList.length === 0) {
-          setPosts([]);
-          setHasMore(false);
-          setFollowsNobody(true);
-          setLoading(false);
-          setLoadingMore(false);
-          // No visible posts — prune all optimistic entries (#1203)
-          OptimisticStore.reconcileFeed(currentUserAddress, []);
-          return;
-        }
-        setFollowsNobody(false);
-
-        // 2. Fetch posts from followed accounts in parallel
-        const postsPromises = followingList.map(async (addr) => {
-          const cursorQuery = cursorParam !== null ? `&cursor=${cursorParam}` : "";
-          const postsRes = await fetch(
-            `${indexerUrl}/api/posts?author=${addr}&limit=10${cursorQuery}`
-          );
-          if (!postsRes.ok) return [];
-          const d = await postsRes.json();
-          return d.posts ?? [];
-        });
+        if (!res.ok) throw new Error("Failed to fetch following feed");
 
         const data = await res.json();
         const fetchedPosts: Post[] = data.posts ?? [];
-        const serverHasMore = data.has_more ?? false;
-        const nextCursor = data.next_cursor ?? null;
+        const serverHasMore: boolean = data.has_more ?? false;
+        const nextCursor: string | null =
+          data.next_cursor != null ? String(data.next_cursor) : null;
 
         if (!append && fetchedPosts.length === 0) {
           try {
@@ -314,23 +295,13 @@ export default function FeedPage() {
             cursor: nextCursor,
             hasMore: serverHasMore,
           });
+          // Reconcile optimistic state against the fresh server response (#1203)
+          OptimisticStore.reconcileFeed(currentUserAddress, newPosts);
           return newPosts;
         });
 
-        // For following tab, we use client-side pagination with cursor
-        const startIdx = append ? posts.length : 0;
-        const paginated = allFetchedPosts.slice(startIdx, startIdx + PAGE_SIZE);
-        const newPosts = append ? [...posts, ...paginated] : paginated;
-        setPosts((prev) => (append ? [...prev, ...paginated] : paginated));
-        setHasMore(startIdx + paginated.length < allFetchedPosts.length);
-        persistFeed({
-          posts: newPosts,
-          cursor: cursorParam,
-          hasMore: startIdx + paginated.length < allFetchedPosts.length,
-        });
-
-        // Reconcile optimistic state against the fresh server response (#1203)
-        OptimisticStore.reconcileFeed(currentUserAddress, newPosts);
+        setHasMore(serverHasMore);
+        if (nextCursor !== null) setCursor(nextCursor);
       } catch (err) {
         setError(err instanceof Error ? err.message : "An error occurred");
       } finally {
@@ -342,7 +313,7 @@ export default function FeedPage() {
   );
 
   const loadFeed = useCallback(
-    (cursorParam: string | number | null, append = false) => {
+    (cursorParam: string | null, append = false) => {
       setError(null);
       if (activeTab === "following") {
         fetchFollowingFeed(cursorParam, append);
@@ -391,9 +362,13 @@ export default function FeedPage() {
       (entries) => {
         if (entries[0]?.isIntersecting) {
           const oldestPost = posts[posts.length - 1];
-          const nextCursor = cursor ?? (oldestPost
-            ? (oldestPost.created_at ?? oldestPost.timestamp ?? null)
-            : null);
+          // cursor is already typed string | null; fall back to the oldest post's
+          // timestamp as an opaque string cursor if the API did not supply one.
+          const nextCursor: string | null =
+            cursor ??
+            (oldestPost
+              ? String(oldestPost.created_at ?? oldestPost.timestamp ?? "") || null
+              : null);
           setCursor(nextCursor);
           loadFeed(nextCursor, true);
         }

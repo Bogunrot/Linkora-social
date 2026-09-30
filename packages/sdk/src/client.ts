@@ -46,10 +46,7 @@ import {
 } from "./queue.js";
 import { submitTransaction } from "./submit.js";
 import { mapMultiOperationAuth } from "./multi-operation-auth.js";
-import {
-  buildBumpSequenceTransaction,
-  buildFeeBumpTransaction,
-} from "./tx-builder.js";
+import { buildBumpSequenceTransaction, buildFeeBumpTransaction } from "./tx-builder.js";
 import {
   ensureAddress,
   ensureAddressList,
@@ -430,7 +427,7 @@ export class LinkoraClient extends GeneratedLinkoraClient {
     // Footprint and soroban transaction data are extracted by the ONE shared
     // pipeline (issue #1356) — the same artifact the submit path signs and
     // sends, so a dry-run cannot diverge from the real submission.
-    const resourceFee = simulation.minResourceFee || "0";
+    const resourceFee = isSimulationSuccess(simulation) ? simulation.minResourceFee || "0" : "0";
     const { footprint, sorobanData } = this.extractSorobanArtifacts(simulation);
 
     return { success: true, resourceFee, footprint, sorobanData };
@@ -497,7 +494,8 @@ export class LinkoraClient extends GeneratedLinkoraClient {
     let footprint: LedgerFootprint = { readOnly: [], readWrite: [] };
     let sorobanData: string | undefined;
 
-    if (simulation.transactionData) {
+    // transactionData is only present on a successful simulation response.
+    if (isSimulationSuccess(simulation) && simulation.transactionData) {
       try {
         const built = simulation.transactionData.build();
         const fp = built.resources().footprint();
@@ -2237,7 +2235,10 @@ export class LinkoraClient extends GeneratedLinkoraClient {
    * } while (cursor);
    * ```
    */
-  async fetchFollowersPage(user: string, opts?: { cursor?: string; pageSize?: number }): Promise<Page<string>> {
+  async fetchFollowersPage(
+    user: string,
+    opts?: { cursor?: string; pageSize?: number }
+  ): Promise<Page<string>> {
     return fetchPageWithCursor<string>({
       cursor: opts?.cursor,
       pageSize: opts?.pageSize,
@@ -2246,7 +2247,10 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /** Fetch ONE page of accounts `user` follows, behind an opaque cursor. */
-  async fetchFollowingPage(user: string, opts?: { cursor?: string; pageSize?: number }): Promise<Page<string>> {
+  async fetchFollowingPage(
+    user: string,
+    opts?: { cursor?: string; pageSize?: number }
+  ): Promise<Page<string>> {
     return fetchPageWithCursor<string>({
       cursor: opts?.cursor,
       pageSize: opts?.pageSize,
@@ -2270,7 +2274,10 @@ export class LinkoraClient extends GeneratedLinkoraClient {
    * Iterate every follower of `user`, transparently walking pages behind the
    * opaque cursor (issue #1358).
    */
-  async *iterateFollowers(user: string, opts?: PaginationOptions): AsyncGenerator<string, void, unknown> {
+  async *iterateFollowers(
+    user: string,
+    opts?: PaginationOptions
+  ): AsyncGenerator<string, void, unknown> {
     yield* paginateList<string>({
       ...opts,
       cursor: opts?.cursor,
@@ -2279,7 +2286,10 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /** Iterate every account `user` follows, transparently walking pages. */
-  async *iterateFollowing(user: string, opts?: PaginationOptions): AsyncGenerator<string, void, unknown> {
+  async *iterateFollowing(
+    user: string,
+    opts?: PaginationOptions
+  ): AsyncGenerator<string, void, unknown> {
     yield* paginateList<string>({
       ...opts,
       cursor: opts?.cursor,
@@ -2288,7 +2298,10 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /** Iterate every post ID authored by `author`, transparently walking pages. */
-  async *iteratePostsByAuthor(author: string, opts?: PaginationOptions): AsyncGenerator<bigint, void, unknown> {
+  async *iteratePostsByAuthor(
+    author: string,
+    opts?: PaginationOptions
+  ): AsyncGenerator<bigint, void, unknown> {
     yield* paginateList<bigint>({
       ...opts,
       cursor: opts?.cursor,
