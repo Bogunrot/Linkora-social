@@ -455,8 +455,9 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
     [walletKit]
   );
 
-  const checkConnectionState = useCallback(async () => {
+  const checkConnectionState = useCallback(async (signal?: AbortSignal) => {
     try {
+      if (signal?.aborted) return;
       setState("loading");
       setError(null);
 
@@ -464,6 +465,8 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         getWalletAddress(),
         getConnectionState(),
       ]);
+
+      if (signal?.aborted) return;
 
       if (!storedAddress || !storedConn || !storedConn.connected) {
         setWallet(EMPTY_WALLET);
@@ -474,6 +477,7 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
       // Corrupt/legacy address: nothing to restore, and it is genuinely invalid.
       if (!isStellarAddress(storedAddress)) {
         await clearStoredSession();
+        if (signal?.aborted) return;
         setWallet(EMPTY_WALLET);
         setState("disconnected");
         return;
@@ -487,6 +491,7 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
 
       const results: Array<{ provider: WalletProviderKind; probe: SessionProbe }> = [];
       for (const candidate of candidates) {
+        if (signal?.aborted) return;
         const probe =
           candidate === "freighter"
             ? await probeFreighterSession(storedAddress)
@@ -494,6 +499,8 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         results.push({ provider: candidate, probe });
         if (probe.status === "restored") break;
       }
+
+      if (signal?.aborted) return;
 
       const match = results.find((result) => result.probe.status === "restored");
       if (match && match.probe.status === "restored") {
@@ -503,6 +510,7 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         if (storedConn.provider !== match.provider) {
           await persistSession(address, match.provider);
         }
+        if (signal?.aborted) return;
         setWallet({
           address,
           network: isKnownNetwork(storedConn.network) ? storedConn.network : selectedNetwork.id,
@@ -520,9 +528,12 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
         await clearStoredSession();
       }
 
+      if (signal?.aborted) return;
+
       setWallet(EMPTY_WALLET);
       setState("disconnected");
     } catch (err) {
+      if (signal?.aborted) return;
       setState("error");
       setError(err instanceof Error ? err.message : "Unknown error");
     }
@@ -537,12 +548,22 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
   // #1593 — run the restore on mount even before the WalletConnect kit is ready;
   // a Freighter session does not depend on it, and a WalletConnect session is
   // retried once `walletKit` arrives (its probe reports "unverifiable" until then).
+  // #1196 — use an AbortController so state setters are no-ops after unmount.
   useEffect(() => {
-    checkConnectionState();
+    const controller = new AbortController();
+    checkConnectionState(controller.signal);
+    return () => {
+      controller.abort();
+    };
   }, [checkConnectionState]);
 
   const connect = useCallback(
     async (provider: WalletProviderKind = "walletconnect") => {
+      // #1196 — guard all post-await state setters so that unmounting mid-connect
+      // does not cause state updates on an unmounted component.
+      let mounted = true;
+      const guard = () => mounted;
+
       try {
         setState("connecting");
         setError(null);
@@ -563,19 +584,28 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
           }
         }
 
+        if (!guard()) return;
+
         if (!address || !isStellarAddress(address)) {
           throw new Error("No address returned from wallet");
         }
 
         await persistSession(address, provider);
 
+        if (!guard()) return;
+
         setWallet({ address, network: selectedNetwork.id, provider });
         setState("connected");
       } catch (err) {
+        if (!guard()) return;
         setState("error");
         setError(err instanceof Error ? err.message : "Connection failed");
         setWallet(EMPTY_WALLET);
       }
+
+      return () => {
+        mounted = false;
+      };
     },
     [persistSession, requestFreighterAddress, selectedNetwork, walletKit]
   );
