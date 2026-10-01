@@ -82,6 +82,9 @@ importers:
       expo-sqlite:
         specifier: ~57.0.1
         version: 57.0.1(expo@57.0.8)(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@11.4.1(@babel/core@7.29.7))(@react-native/jest-preset@0.86.0(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.16)(react@19.2.3))(react@19.2.3)
+      linkora-sdk:
+        specifier: workspace:*
+        version: link:../../packages/sdk
       lucide-react-native:
         specifier: ^0.511.0
         version: 0.511.0(react-native-svg@15.15.4(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@11.4.1(@babel/core@7.29.7))(@react-native/jest-preset@0.86.0(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.16)(react@19.2.3))(react@19.2.3))(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@11.4.1(@babel/core@7.29.7))(@react-native/jest-preset@0.86.0(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.16)(react@19.2.3))(react@19.2.3)

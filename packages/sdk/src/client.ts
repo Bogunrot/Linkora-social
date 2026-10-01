@@ -1478,6 +1478,114 @@ export class LinkoraClient extends GeneratedLinkoraClient {
   }
 
   /**
+   * Build a submittable block_user transaction with the caller as the proper
+   * source account.
+   *
+   * @param blocker The Stellar public key of the user initiating the block.
+   * @param blocked The Stellar public key of the user being blocked.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareBlockUserTx(
+    blocker: string,
+    blocked: string,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddress(blocker, "blocker");
+    ensureAddress(blocked, "blocked");
+    const sourceAccount = await this.getAccountForTx(blocker, horizonUrl);
+    const tx = await this.prepareTransaction(
+      "block_user",
+      sourceAccount,
+      scvAddress(blocker),
+      scvAddress(blocked)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable unblock_user transaction with the caller as the proper
+   * source account.
+   *
+   * @param blocker The Stellar public key of the user who created the block.
+   * @param blocked The Stellar public key of the user being unblocked.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareUnblockUserTx(
+    blocker: string,
+    blocked: string,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddress(blocker, "blocker");
+    ensureAddress(blocked, "blocked");
+    const sourceAccount = await this.getAccountForTx(blocker, horizonUrl);
+    const tx = await this.prepareTransaction(
+      "unblock_user",
+      sourceAccount,
+      scvAddress(blocker),
+      scvAddress(blocked)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable delete_post transaction with the author as the proper
+   * source account.
+   *
+   * @param author The Stellar public key of the post author (and required signer).
+   * @param postId The id of the post to delete.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareDeletePostTx(
+    author: string,
+    postId: number | bigint,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddress(author, "author");
+    ensurePositiveInteger(postId, "postId");
+    const sourceAccount = await this.getAccountForTx(author, horizonUrl);
+    const tx = await this.prepareTransaction(
+      "delete_post",
+      sourceAccount,
+      scvAddress(author),
+      nativeToScVal(postId, { type: "u64" })
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable set_profile transaction with the caller as the proper
+   * source account.
+   *
+   * @param user The Stellar public key of the profile owner.
+   * @param username The new username.
+   * @param creatorToken The SEP-41 creator token contract address.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareSetProfileTx(
+    user: string,
+    username: string,
+    creatorToken: string,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddress(user, "user");
+    ensureNonEmptyString(username, "username");
+    ensureContractAddress(creatorToken, "creatorToken");
+    const sourceAccount = await this.getAccountForTx(user, horizonUrl);
+    const tx = await this.prepareTransaction(
+      "set_profile",
+      sourceAccount,
+      scvAddress(user),
+      scvString(username),
+      scvAddress(creatorToken)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
    * Block a user.
    *
    * @param blocker The Stellar public key of the user initiating the block.
@@ -1844,6 +1952,96 @@ export class LinkoraClient extends GeneratedLinkoraClient {
       scvSymbol(poolId),
       scvI128(amount),
       scvAddress(recipient)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable add_pool_admin transaction with the first signer as the
+   * proper source account.
+   *
+   * @param signers Array of Stellar public keys of the admins authorizing the change.
+   * @param poolId The ID of the pool.
+   * @param newAdmin The Stellar public key to add as an admin.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareAddPoolAdminTx(
+    signers: string[],
+    poolId: string,
+    newAdmin: string,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddressList(signers, "signers");
+    ensureNonEmptyString(poolId, "poolId");
+    ensureAddress(newAdmin, "newAdmin");
+    const sourceAccount = await this.getAccountForTx(signers[0], horizonUrl);
+    const tx = await this.prepareTransaction(
+      "add_pool_admin",
+      sourceAccount,
+      scvAddressVec(signers),
+      scvSymbol(poolId),
+      scvAddress(newAdmin)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable remove_pool_admin transaction with the first signer as
+   * the proper source account.
+   *
+   * @param signers Array of Stellar public keys of the admins authorizing the change.
+   * @param poolId The ID of the pool.
+   * @param admin The Stellar public key of the admin to remove.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareRemovePoolAdminTx(
+    signers: string[],
+    poolId: string,
+    admin: string,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddressList(signers, "signers");
+    ensureNonEmptyString(poolId, "poolId");
+    ensureAddress(admin, "admin");
+    const sourceAccount = await this.getAccountForTx(signers[0], horizonUrl);
+    const tx = await this.prepareTransaction(
+      "remove_pool_admin",
+      sourceAccount,
+      scvAddressVec(signers),
+      scvSymbol(poolId),
+      scvAddress(admin)
+    );
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Build a submittable update_pool_threshold transaction with the first signer
+   * as the proper source account.
+   *
+   * @param signers Array of Stellar public keys of the admins authorizing the change.
+   * @param poolId The ID of the pool.
+   * @param threshold The new signing threshold.
+   * @param horizonUrl Optional Horizon URL to use. Defaults based on the network passphrase.
+   * @returns The base64-encoded transaction envelope XDR ready for wallet signing.
+   */
+  async prepareUpdatePoolThresholdTx(
+    signers: string[],
+    poolId: string,
+    threshold: number | bigint,
+    horizonUrl?: string
+  ): Promise<string> {
+    ensureAddressList(signers, "signers");
+    ensureNonEmptyString(poolId, "poolId");
+    ensurePositiveInteger(threshold, "threshold");
+    const sourceAccount = await this.getAccountForTx(signers[0], horizonUrl);
+    const tx = await this.prepareTransaction(
+      "update_pool_threshold",
+      sourceAccount,
+      scvAddressVec(signers),
+      scvSymbol(poolId),
+      nativeToScVal(Number(threshold), { type: "u32" })
     );
     return tx.toEnvelope().toXDR("base64");
   }
