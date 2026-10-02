@@ -7,6 +7,7 @@ import { OnboardingProvider } from "@/contexts/OnboardingContext";
 import { GuidedTourProvider } from "@/contexts/GuidedTourContext";
 import { GuidedTour } from "@/components/onboarding/GuidedTour";
 import { ThemeBootstrap } from "@/components/ThemeBootstrap";
+import { ThemeProvider } from "@/contexts/ThemeContext";
 import { KeyboardShortcutsProvider } from "@/contexts/KeyboardShortcutsContext";
 import { KeyboardShortcutsModal } from "@/components/KeyboardShortcutsModal";
 import { ServiceWorkerRegistration } from "@/components/ServiceWorkerRegistration";
@@ -23,6 +24,39 @@ export const metadata: Metadata = {
     apple: "/logo/logo-icon.svg",
   },
 };
+
+/**
+ * The real application provider tree.
+ *
+ * Exported (and rendered by `RootLayout`) so tests can assert that a provider
+ * the feature depends on is actually mounted in the running app, rather than
+ * wrapping a component in the provider by hand and calling that coverage.
+ */
+export function AppProviders({ children }: { children: React.ReactNode }) {
+  return (
+    <ThemeProvider>
+      <WalletProvider>
+        {/* KeyboardShortcutsProvider reads the wallet via useWallet, so it must
+            sit inside WalletProvider. NavBar and KeyboardShortcutsModal consume
+            its context, so both must sit inside this provider. */}
+        <KeyboardShortcutsProvider>
+          <OnboardingProvider>
+            <GuidedTourProvider>
+              <NotificationsProvider>
+                <NavBar />
+                <main id="main-content" tabIndex={-1} className="pb-safe md:pb-0">
+                  {children}
+                </main>
+                <GuidedTour />
+                <KeyboardShortcutsModal />
+              </NotificationsProvider>
+            </GuidedTourProvider>
+          </OnboardingProvider>
+        </KeyboardShortcutsProvider>
+      </WalletProvider>
+    </ThemeProvider>
+  );
+}
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -44,19 +78,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           Skip to content
         </a>
         <ThemeBootstrap />
-        <WalletProvider>
-          <OnboardingProvider>
-            <GuidedTourProvider>
-              <NotificationsProvider>
-                <NavBar />
-                <main id="main-content" tabIndex={-1} className="pb-safe md:pb-0">
-                  {children}
-                </main>
-                <GuidedTour />
-              </NotificationsProvider>
-            </GuidedTourProvider>
-          </OnboardingProvider>
-        </WalletProvider>
+        <AppProviders>{children}</AppProviders>
       </body>
     </html>
   );

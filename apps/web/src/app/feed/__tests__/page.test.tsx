@@ -1,1 +1,0 @@
-/* DEPRECATED - use src/app/feed/page.test.tsx */

@@ -66,9 +66,34 @@ export default function PoolAdminsScreen(): JSX.Element {
   };
 
   /**
-   * #1557 — the only way to add an approval. The connected admin signs an
-   * approval transaction with their own wallet; there is no per-admin toggle
-   * to click on someone else's behalf.
+   * #1591 — map a queued UI action onto the contract entrypoint that actually
+   * implements it. There is no `pool_admin_change` / `pool_admin_change_approve`
+   * entrypoint on the contract; the real ones are `add_pool_admin`,
+   * `remove_pool_admin` and `update_pool_threshold`.
+   */
+  const descriptorForAction = (
+    action: PendingAction,
+    signers: string
+  ): string => {
+    const approvals = signers
+      .split(",")
+      .map((entry) => `${entry.trim()}=pending`)
+      .join(",");
+
+    switch (action.kind) {
+      case "add":
+        return `add_pool_admin:${poolId}:${action.value}:${approvals}`;
+      case "remove":
+        return `remove_pool_admin:${poolId}:${action.value}:${approvals}`;
+      case "threshold":
+        return `update_pool_threshold:${poolId}:${action.value}:${approvals}`;
+    }
+  };
+
+  /**
+   * #1557 — the only way to add an approval. The connected admin signs a real
+   * contract invocation with their own wallet; there is no per-admin toggle to
+   * click on someone else's behalf.
    */
   const signPendingAction = async () => {
     if (!connectedAddress || !connectedIsAdmin || !pendingAction) {
@@ -80,7 +105,7 @@ export default function PoolAdminsScreen(): JSX.Element {
 
     try {
       const signature = await submitTx(
-        `pool_admin_change_approve:${poolId}:${pendingAction.kind}:${pendingAction.value}:${connectedAddress}`
+        descriptorForAction(pendingAction, connectedAddress)
       );
 
       setPendingAction((current) =>
@@ -114,9 +139,10 @@ export default function PoolAdminsScreen(): JSX.Element {
       // #1557 — the contract receives the action plus the threshold set of
       // signatures and is the only thing that decides whether it applies.
       await submitTx(
-        `pool_admin_change:${poolId}:${pendingAction.kind}:${pendingAction.value}:${pendingApprovals
-          .map((approval) => `${approval.address}=${approval.signature}`)
-          .join(",")}`
+        descriptorForAction(
+          pendingAction,
+          pendingApprovals.map((approval) => approval.address).join(",")
+        )
       );
       setMessage("Change submitted. The contract has the final say.");
       setPendingAction(null);
