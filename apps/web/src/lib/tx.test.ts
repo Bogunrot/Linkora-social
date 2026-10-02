@@ -1,226 +1,160 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { signAndSubmitTransaction, buildSignAndSubmit } from "./tx";
-import { signTransaction } from "@stellar/freighter-api";
+import { signAndSubmitTransaction, buildSignAndSubmit } from './tx';
 import {
   TransactionBuilder,
-  BASE_FEE,
   Contract,
-  Address,
   rpc as StellarRpc,
-} from "@stellar/stellar-sdk";
+} from '@stellar/stellar-sdk';
+import { signTransaction } from '@stellar/freighter-api';
 
-// Mock Freighter API
-vi.mock("@stellar/freighter-api", () => ({
-  signTransaction: vi.fn(),
-}));
+jest.mock('@stellar/stellar-sdk', () => {
+  const fromXDR = jest.fn();
+  const TransactionBuilderMock = jest.fn();
+  (TransactionBuilderMock as unknown as { fromXDR: unknown }).fromXDR = fromXDR;
 
-// Mock Stellar SDK
-vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
   return {
-    ...actual,
-    TransactionBuilder: {
-      fromXDR: vi.fn(),
-    },
+    BASE_FEE: 100,
+    TransactionBuilder: TransactionBuilderMock,
+    Contract: jest.fn(),
+    Address: { fromString: jest.fn() },
+    Transaction: jest.fn(),
+    xdr: {},
     rpc: {
-      Server: vi.fn().mockImplementation(() => ({
-        getAccount: vi.fn(),
-        simulateTransaction: vi.fn(),
-        sendTransaction: vi.fn(),
-        getTransaction: vi.fn(),
-      })),
-      Api: {
-        isSimulationError: vi.fn(),
-      },
-      assembleTransaction: vi.fn(),
+      Server: jest.fn(),
+      Api: { isSimulationError: jest.fn() },
+      assembleTransaction: jest.fn(),
     },
   };
 });
 
-describe("Transaction Utility Functions", () => {
-  const mockConfig = {
-    contractId: "CDUMMY",
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    networkPassphrase: "Test SDF Network ; September 2015",
-  };
+jest.mock('@stellar/freighter-api', () => ({
+  signTransaction: jest.fn(),
+}));
 
-  beforeEach(() => {
-    vi.clearAllMocks();
+const mockFromXDR = TransactionBuilder.fromXDR as unknown as jest.Mock;
+const mockSignTransaction = signTransaction as jest.Mock;
+const mockIsSimulationError = StellarRpc.Api.isSimulationError as unknown as jest.Mock;
+const mockAssembleTransaction = StellarRpc.assembleTransaction as unknown as jest.Mock;
+
+const mockSendTransaction = jest.fn();
+const mockGetTransaction = jest.fn();
+const mockGetAccount = jest.fn();
+const mockSimulateTransaction = jest.fn();
+
+const CONFIG = {
+  contractId: 'CDUMMY',
+  rpcUrl: 'https://soroban-testnet.stellar.org',
+  networkPassphrase: 'Test SDF Network ; September 2022',
+};
+
+const builtTx = { toXDR: () => 'base64XDR' };
+const transactionBuilderChain = {
+  addOperation: jest.fn().mockReturnThis(),
+  setTimeout: jest.fn().mockReturnThis(),
+  build: jest.fn().mockReturnValue(builtTx),
+};
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  (StellarRpc.Server as unknown as jest.Mock).mockImplementation(() => ({
+    sendTransaction: mockSendTransaction,
+    getTransaction: mockGetTransaction,
+    getAccount: mockGetAccount,
+    simulateTransaction: mockSimulateTransaction,
+  }));
+  mockFromXDR.mockReturnValue({ signedTx: true });
+  mockSignTransaction.mockResolvedValue('signedXDR');
+});
+
+describe('signAndSubmitTransaction', () => {
+  it('signs, submits and returns the confirmed hash', async () => {
+    mockSendTransaction.mockResolvedValue({ status: 'SUCCESS', hash: 'abc123' });
+
+    await expect(signAndSubmitTransaction('unsignedXDR', CONFIG)).resolves.toEqual({
+      hash: 'abc123',
+      status: 'SUCCESS',
+    });
+
+    expect(mockSignTransaction).toHaveBeenCalledWith('unsignedXDR', {
+      networkPassphrase: CONFIG.networkPassphrase,
+    });
+    expect(mockFromXDR).toHaveBeenCalledWith('signedXDR', CONFIG.networkPassphrase);
+    expect(mockSendTransaction).toHaveBeenCalledWith({ signedTx: true });
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
+  it('polls until the transaction leaves the PENDING state', async () => {
+    mockSendTransaction.mockResolvedValue({ status: 'PENDING', hash: 'abc123' });
+    mockGetTransaction
+      .mockResolvedValueOnce({ status: 'PENDING' })
+      .mockResolvedValueOnce({ status: 'SUCCESS' });
+
+    await expect(signAndSubmitTransaction('unsignedXDR', CONFIG)).resolves.toEqual({
+      hash: 'abc123',
+      status: 'SUCCESS',
+    });
+
+    expect(mockGetTransaction).toHaveBeenCalledTimes(2);
+    expect(mockGetTransaction).toHaveBeenCalledWith('abc123');
   });
 
-  describe("signAndSubmitTransaction", () => {
-    it("should sign transaction with Freighter and submit to RPC", async () => {
-      const mockSignedXdr = "signed-xdr-string";
-      const mockTxHash = "test-hash-123";
-      const mockSendResponse = {
-        hash: mockTxHash,
-        status: "PENDING",
-      };
+  it('throws when submission is rejected up front', async () => {
+    mockSendTransaction.mockResolvedValue({ status: 'ERROR', hash: 'abc123' });
 
-      (signTransaction as any).mockResolvedValue(mockSignedXdr);
-
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.sendTransaction as any).mockResolvedValue(mockSendResponse);
-      (mockServer.getTransaction as any).mockResolvedValue({
-        status: "SUCCESS",
-      });
-
-      const result = await signAndSubmitTransaction("test-xdr", mockConfig);
-
-      expect(signTransaction).toHaveBeenCalledWith("test-xdr", {
-        networkPassphrase: mockConfig.networkPassphrase,
-      });
-      expect(mockServer.sendTransaction).toHaveBeenCalled();
-      expect(result.hash).toBe(mockTxHash);
-      expect(result.status).toBe("SUCCESS");
-    });
-
-    it("should throw error if transaction submission fails", async () => {
-      const mockSignedXdr = "signed-xdr-string";
-      (signTransaction as any).mockResolvedValue(mockSignedXdr);
-
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.sendTransaction as any).mockResolvedValue({
-        status: "ERROR",
-      });
-
-      await expect(signAndSubmitTransaction("test-xdr", mockConfig)).rejects.toThrow(
-        "Transaction failed to submit"
-      );
-    });
-
-    it("should throw error if transaction confirmation times out", async () => {
-      const mockSignedXdr = "signed-xdr-string";
-      const mockTxHash = "test-hash-123";
-      (signTransaction as any).mockResolvedValue(mockSignedXdr);
-
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.sendTransaction as any).mockResolvedValue({
-        hash: mockTxHash,
-        status: "PENDING",
-      });
-      (mockServer.getTransaction as any).mockResolvedValue({
-        status: "PENDING",
-      });
-
-      await expect(signAndSubmitTransaction("test-xdr", mockConfig, 100)).rejects.toThrow(
-        "Transaction confirmation timeout"
-      );
-    });
+    await expect(signAndSubmitTransaction('unsignedXDR', CONFIG)).rejects.toThrow(
+      'Transaction failed to submit'
+    );
   });
 
-  describe("buildSignAndSubmit", () => {
-    it("should build, sign, and submit contract method call", async () => {
-      const mockAccount = {
-        sequence: "1234567890",
-      };
-      const mockSimulated = {
-        minResourceFee: "100",
-        transactionData: null,
-        result: { xdr: "result-xdr" },
-      };
-      const mockSignedXdr = "signed-xdr-string";
-      const mockTxHash = "test-hash-456";
-      const mockSendResponse = {
-        hash: mockTxHash,
-        status: "PENDING",
-      };
+  it('throws when the transaction fails during execution', async () => {
+    mockSendTransaction.mockResolvedValue({ status: 'PENDING', hash: 'abc123' });
+    mockGetTransaction.mockResolvedValue({ status: 'FAILED' });
 
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.getAccount as any).mockResolvedValue(mockAccount);
-      (mockServer.simulateTransaction as any).mockResolvedValue(mockSimulated);
-      (StellarRpc.Api.isSimulationError as any).mockReturnValue(false);
-      (StellarRpc.assembleTransaction as any).mockReturnValue({
-        build: vi.fn().mockReturnValue({
-          toXDR: vi.fn().mockReturnValue("unsigned-xdr"),
-        }),
-      });
-      (signTransaction as any).mockResolvedValue(mockSignedXdr);
-      (mockServer.sendTransaction as any).mockResolvedValue(mockSendResponse);
-      (mockServer.getTransaction as any).mockResolvedValue({
-        status: "SUCCESS",
-      });
+    await expect(signAndSubmitTransaction('unsignedXDR', CONFIG)).rejects.toThrow(
+      'Transaction failed during execution'
+    );
+  });
 
-      const args = [
-        Address.fromString("GABC123").toScVal(),
-        Address.fromString("GDEF456").toScVal(),
-      ];
+  it('throws when the wallet rejects the signature', async () => {
+    mockSignTransaction.mockRejectedValue(new Error('Signing failed'));
 
-      const result = await buildSignAndSubmit("test_method", args, "GABC123", mockConfig);
+    await expect(signAndSubmitTransaction('unsignedXDR', CONFIG)).rejects.toThrow('Signing failed');
+    expect(mockSendTransaction).not.toHaveBeenCalled();
+  });
+});
 
-      expect(mockServer.getAccount).toHaveBeenCalledWith("GABC123");
-      expect(mockServer.simulateTransaction).toHaveBeenCalled();
-      expect(signTransaction).toHaveBeenCalled();
-      expect(mockServer.sendTransaction).toHaveBeenCalled();
-      expect(result.hash).toBe(mockTxHash);
-      expect(result.status).toBe("SUCCESS");
-    });
+describe('buildSignAndSubmit', () => {
+  it('simulates, assembles and submits the encoded transaction XDR', async () => {
+    mockGetAccount.mockResolvedValue({ accountId: 'GALICE', sequence: '1' });
+    mockSimulateTransaction.mockResolvedValue({ result: 'ok' });
+    mockIsSimulationError.mockReturnValue(false);
+    mockAssembleTransaction.mockReturnValue(transactionBuilderChain);
+    mockSendTransaction.mockResolvedValue({ status: 'SUCCESS', hash: 'def456' });
 
-    it("should throw error if simulation fails", async () => {
-      const mockAccount = {
-        sequence: "1234567890",
-      };
-      const mockSimulated = {
-        error: "Simulation error",
-      };
+    const call = jest.fn();
+    (Contract as unknown as jest.Mock).mockImplementation(() => ({ call }));
+    (TransactionBuilder as unknown as jest.Mock).mockImplementation(() => transactionBuilderChain);
 
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.getAccount as any).mockResolvedValue(mockAccount);
-      (mockServer.simulateTransaction as any).mockResolvedValue(mockSimulated);
-      (StellarRpc.Api.isSimulationError as any).mockReturnValue(true);
+    const scval = { toString: () => 'scval' } as never;
+    const result = await buildSignAndSubmit('like_post', [scval], 'GALICE', CONFIG);
 
-      const args = [
-        Address.fromString("GABC123").toScVal(),
-        Address.fromString("GDEF456").toScVal(),
-      ];
-
-      await expect(buildSignAndSubmit("test_method", args, "GABC123", mockConfig)).rejects.toThrow(
-        "Transaction simulation failed"
-      );
+    expect(result).toEqual({ hash: 'def456', status: 'SUCCESS' });
+    expect(Contract).toHaveBeenCalledWith(CONFIG.contractId);
+    expect(call).toHaveBeenCalledWith('like_post', scval);
+    expect(transactionBuilderChain.setTimeout).toHaveBeenCalledWith(30);
+    expect(mockSimulateTransaction).toHaveBeenCalledWith(builtTx);
+    expect(mockAssembleTransaction).toHaveBeenCalledWith(builtTx, { result: 'ok' });
+    expect(mockSignTransaction).toHaveBeenCalledWith('base64XDR', {
+      networkPassphrase: CONFIG.networkPassphrase,
     });
   });
 
-  describe("Regression Test: Discarded XDR Prevention", () => {
-    it("should NOT allow XDR to be built without submission", () => {
-      // This test verifies that the transaction flow requires actual submission
-      // The old bug was: const _txXdr = client.likePost(...); // XDR discarded
+  it('surfaces simulation errors instead of submitting a doomed transaction', async () => {
+    mockGetAccount.mockResolvedValue({ accountId: 'GALICE', sequence: '1' });
+    mockSimulateTransaction.mockResolvedValue({ error: 'insufficient balance' });
+    mockIsSimulationError.mockReturnValue(true);
 
-      const mockConfig = {
-        contractId: "CDUMMY",
-        rpcUrl: "https://soroban-testnet.stellar.org",
-        networkPassphrase: "Test SDF Network ; September 2015",
-      };
-
-      // Verify that buildSignAndSubmit is called (which includes submission)
-      // This is a behavioral test - the actual implementation should use
-      // buildSignAndSubmit or signAndSubmitTransaction, not just build XDR
-
-      expect(typeof buildSignAndSubmit).toBe("function");
-      expect(typeof signAndSubmitTransaction).toBe("function");
-    });
-
-    it("should require signing before submission", async () => {
-      // Verify that signTransaction is called in the flow
-      const mockSignedXdr = "signed-xdr-string";
-      (signTransaction as any).mockResolvedValue(mockSignedXdr);
-
-      const mockServer = new StellarRpc.Server(mockConfig.rpcUrl);
-      (mockServer.sendTransaction as any).mockResolvedValue({
-        hash: "test-hash",
-        status: "SUCCESS",
-      });
-      (mockServer.getTransaction as any).mockResolvedValue({
-        status: "SUCCESS",
-      });
-
-      await signAndSubmitTransaction("test-xdr", mockConfig);
-
-      // This assertion ensures signing happens before submission
-      expect(signTransaction).toHaveBeenCalled();
-    });
+    await expect(buildSignAndSubmit('like_post', [], 'GALICE', CONFIG)).rejects.toThrow(
+      'Transaction simulation failed: insufficient balance'
+    );
+    expect(mockSendTransaction).not.toHaveBeenCalled();
   });
 });

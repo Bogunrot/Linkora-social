@@ -1,23 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useWalletContext } from "@/components/WalletProvider";
 import { useNotificationsContext } from "@/contexts/NotificationsContext";
+import type { Notification } from "@/contexts/NotificationsContext";
 
-export type NotificationType = "follow" | "like" | "tip" | "governance";
-
-export interface Notification {
-  id: string;
-  type: NotificationType;
-  actor: string;
-  postId?: number;
-  proposalId?: number;
-  parameter?: string;
-  amountXlm?: string;
-  excerpt?: string;
-  timestamp: string;
-  read: boolean;
-}
+export type { NotificationType, Notification } from "@/contexts/NotificationsContext";
 
 const LS_NOTIFICATIONS_KEY = "linkora:notifications:items";
 const PAGE_SIZE = 10;
@@ -56,9 +44,23 @@ async function fetchPostExcerpt(postId: number): Promise<string | undefined> {
   }
 }
 
+function sortByTimestampDesc(items: Notification[]): Notification[] {
+  return [...items].sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+}
+
+/**
+ * Consumer over the canonical NotificationsProvider for the global unread
+ * badge, while owning a local inbox feed for the connected wallet.
+ *
+ * The inbox is persisted per-address in localStorage so it survives reloads;
+ * the shared unread counters live in `NotificationsContext` so the navbar
+ * badge and this hook stay in sync.
+ */
 export function useNotifications() {
   const { address } = useWalletContext();
-  const { incrementUnread, resetUnread } = useNotificationsContext();
+  const { incrementUnread, decrementUnread, resetUnread } = useNotificationsContext();
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [page, setPage] = useState(1);
   const addressRef = useRef<string | null>(null);
@@ -77,9 +79,7 @@ export function useNotifications() {
       if (!addressRef.current) return;
       setNotifications((prev) => {
         if (prev.some((x) => x.id === n.id)) return prev;
-        const next = [n, ...prev].sort(
-          (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-        );
+        const next = sortByTimestampDesc([n, ...prev]);
         persist(addressRef.current!, next);
         return next;
       });
@@ -185,6 +185,27 @@ export function useNotifications() {
     resetUnread();
   }, [resetUnread]);
 
+  /**
+   * Mark a single notification as read and keep the global unread counter in
+   * sync. Unread state is preserved until the user explicitly reads an item
+   * (or uses "Mark all read"); it is never cleared just by visiting the page.
+   */
+  const markRead = useCallback(
+    (id: string) => {
+      if (!addressRef.current) return;
+      const target = notifications.find((n) => n.id === id);
+      if (target?.read) return;
+
+      setNotifications((prev) => {
+        const next = prev.map((n) => (n.id === id ? { ...n, read: true } : n));
+        persist(addressRef.current!, next);
+        return next;
+      });
+      decrementUnread();
+    },
+    [decrementUnread, notifications]
+  );
+
   const loadMore = useCallback(() => {
     setPage((p) => p + 1);
   }, []);
@@ -193,5 +214,12 @@ export function useNotifications() {
   const hasMore = notifications.length > page * PAGE_SIZE;
   const unreadCount = notifications.filter((n) => !n.read).length;
 
-  return { notifications: visibleNotifications, hasMore, unreadCount, markAllRead, loadMore };
+  return {
+    notifications: visibleNotifications,
+    hasMore,
+    unreadCount,
+    markAllRead,
+    markRead,
+    loadMore,
+  };
 }

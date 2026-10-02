@@ -6,9 +6,13 @@ import { getFeedPosts } from "../../handlers/post";
 import { validateParams, validateQuery } from "../../middleware/validate";
 import { z } from "zod";
 import { stellarAddressSchema, cursorPaginationSchema } from "@linkora/types/src/schemas";
+import { decodeNumericCursor, decodeTimestampCursor, encodeCursor } from "./cursor";
 
 const exploreQuerySchema = cursorPaginationSchema.extend({
-  cursor: z.coerce.number().optional(),
+  // Opaque composite cursor (score, id) — see ./cursor.ts (#1329). A bare
+  // numeric cursor is no longer accepted: `score` alone cannot order rows
+  // that tie, which used to skip or duplicate them across pages.
+  cursor: z.string().optional(),
   tag: z.string().optional(),
 });
 
@@ -18,6 +22,7 @@ const followingFeedParamsSchema = z.object({
 
 const followingFeedQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
+  // Opaque composite cursor (created_at, id) — see ./cursor.ts (#1329).
   cursor: z.string().optional(),
   tag: z.string().optional(),
 });
@@ -104,7 +109,8 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
       const { limit, cursor, tag } = req.query as unknown as z.infer<typeof exploreQuerySchema>;
 
       if (!isPgPool(dbOrPg)) {
-        const { posts } = await (dbOrPg as Database).listPosts({ limit, offset: cursor ?? 0 });
+        const offset = cursor !== undefined ? (decodeNumericCursor(cursor)?.value ?? 0) : 0;
+        const { posts } = await (dbOrPg as Database).listPosts({ limit, offset });
         res.json({ posts, has_more: false, next_cursor: null });
         return;
       }
@@ -132,12 +138,19 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
       }
 
       if (cursor !== undefined) {
-        query += ` AND score < $${paramIndex}`;
-        params.push(cursor);
-        paramIndex++;
+        const decoded = decodeNumericCursor(cursor);
+        if (!decoded) {
+          res.status(400).json({ error: "Invalid cursor" });
+          return;
+        }
+        // Composite keyset: strictly orders rows that tie on `score` by `id`
+        // too, so a tied boundary row is never skipped or repeated (#1329).
+        query += ` AND (score, id) < ($${paramIndex}, $${paramIndex + 1})`;
+        params.push(decoded.value, decoded.id);
+        paramIndex += 2;
       }
 
-      query += ` ORDER BY score DESC LIMIT $${paramIndex}`;
+      query += ` ORDER BY score DESC, id DESC LIMIT $${paramIndex}`;
       params.push(limit);
 
       const result = await queryView(dbOrPg, query, params);
@@ -154,7 +167,13 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           score: row.score,
         })),
         has_more: result.rows.length === limit,
-        next_cursor: result.rows.length > 0 ? result.rows[result.rows.length - 1].score : null,
+        next_cursor:
+          result.rows.length > 0
+            ? encodeCursor(
+                String(result.rows[result.rows.length - 1].score),
+                String(result.rows[result.rows.length - 1].id)
+              )
+            : null,
       });
     }
   );
@@ -165,7 +184,9 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
     validateQuery(followingFeedQuerySchema),
     async (req: Request, res: Response): Promise<void> => {
       const address = req.params.address;
-      const { limit, cursor, tag } = req.query as unknown as z.infer<typeof followingFeedQuerySchema>;
+      const { limit, cursor, tag } = req.query as unknown as z.infer<
+        typeof followingFeedQuerySchema
+      >;
 
       if (!isPgPool(dbOrPg)) {
         const { posts } = await (dbOrPg as Database).listPosts({ limit, offset: 0 });
@@ -189,7 +210,7 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker = $1 AND blocked = p.author)
           AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocker = p.author AND blocked = $1)
       `;
-      const params: (string | Date)[] = [address];
+      const params: unknown[] = [address];
       let paramIndex = 2;
 
       if (tag) {
@@ -199,15 +220,22 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
       }
 
       if (cursor !== undefined) {
-        query += ` AND p.created_at < $${paramIndex}`;
-        params.push(new Date(cursor));
-        paramIndex++;
+        const decoded = decodeTimestampCursor(cursor);
+        if (!decoded) {
+          res.status(400).json({ error: "Invalid cursor" });
+          return;
+        }
+        // Composite keyset: strictly orders rows that tie on `created_at` by
+        // `id` too, so a tied boundary row is never skipped or repeated (#1329).
+        query += ` AND (p.created_at, p.id) < ($${paramIndex}, $${paramIndex + 1})`;
+        params.push(decoded.value, decoded.id);
+        paramIndex += 2;
       }
 
-      query += ` ORDER BY p.created_at DESC LIMIT $${paramIndex}`;
-      params.push(String(limit));
+      query += ` ORDER BY p.created_at DESC, p.id DESC LIMIT $${paramIndex}`;
+      params.push(limit);
 
-      const result = await dbOrPg.query(query, params);
+      const result = await queryView(dbOrPg, query, params);
 
       res.json({
         posts: result.rows.map((row) => ({
@@ -220,7 +248,13 @@ export function createFeedRouter(dbOrPg: Database | Pool): Router {
           created_at: row.created_at,
         })),
         has_more: result.rows.length === limit,
-        next_cursor: result.rows.length > 0 ? result.rows[result.rows.length - 1].created_at : null,
+        next_cursor:
+          result.rows.length > 0
+            ? encodeCursor(
+                new Date(result.rows[result.rows.length - 1].created_at).toISOString(),
+                String(result.rows[result.rows.length - 1].id)
+              )
+            : null,
       });
     }
   );

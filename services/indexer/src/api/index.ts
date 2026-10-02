@@ -4,7 +4,7 @@ import { Pool as PgPool } from "pg";
 import { Database } from "../db";
 import { logger, requestLoggingMiddleware } from "../logger";
 import { rateLimit, rateLimitWrite, getRateLimitStoreStatus } from "../middleware/rateLimit";
-import { requireStellarAuth } from "../middleware/stellarAuth";
+import { requireStellarAuth, optionalStellarAuth } from "../middleware/stellarAuth";
 import { jsonWithRawBody } from "../middleware/rawBody";
 import { validateBody } from "../middleware/validate";
 import { z } from "zod";
@@ -18,6 +18,7 @@ import { createGovernanceRouter } from "./routes/governance";
 import { createUsersRouter } from "./routes/users";
 import { createFeedRouter } from "./routes/feed";
 import { createSearchRouter } from "./routes/search";
+import { MediaUploadConfig } from "../config";
 import { isFenced } from "../gossip";
 import { getBackfillState } from "../stream";
 import {
@@ -28,6 +29,7 @@ import {
 import { PostgresDatabase } from "../postgres-db";
 import { HealthMonitor } from "../services/health-monitor";
 import { metricsText } from "../metrics";
+import { attachPoolMonitoring } from "../db-pool-monitor";
 
 let warnedMissingAllowedOrigins = false;
 
@@ -82,7 +84,8 @@ export function createApp(
   db: Database,
   pg?: PgPool,
   healthMonitor?: HealthMonitor,
-  shutdownState?: { active: boolean }
+  shutdownState?: { active: boolean },
+  mediaUpload?: MediaUploadConfig
 ): express.Application {
   const app = express();
   app.use(helmet());
@@ -167,6 +170,19 @@ export function createApp(
     }
   });
 
+  // ── Auth + rate limiting ──────────────────────────────────────────────────
+  //
+  // Issue #1325: the rate-limit middleware selects the per-address bucket only
+  // when `req.context.stellarAddress` is already populated. The old ordering
+  // was `rateLimit` → per-route `requireStellarAuth`, so the address was never
+  // set when the read rate-limiter ran; authenticated reads always fell through
+  // to the lower anon IP-keyed bucket.
+  //
+  // Fix: run `optionalStellarAuth` first for every /api request. It sets
+  // `req.context.stellarAddress` for callers who include a valid StellarSig
+  // header without rejecting unauthenticated requests. The rate-limiter that
+  // follows can then correctly choose the per-address or per-IP bucket.
+  app.use("/api", optionalStellarAuth);
   app.use("/api", rateLimit);
 
   app.use("/api", (req: Request, res: Response, next: NextFunction): void => {
@@ -183,8 +199,12 @@ export function createApp(
     next();
   });
 
+  // Every route mounted here must be documented in `openapi.yaml`.
+  // `src/api/__tests__/openapi.test.ts` walks this router stack and fails CI
+  // when a mounted route is undocumented or a documented route is stale, so a
+  // new endpoint cannot ship without a contract.
   app.use("/api/profiles", createProfilesRouter(db));
-  app.use("/api/posts", createPostsRouter(db));
+  app.use("/api/posts", createPostsRouter(db, mediaUpload));
   app.use("/api/search", createSearchRouter(db));
   app.use("/api/follows", createFollowsRouter(db));
   app.use("/api/pools", createPoolsRouter(db));
@@ -233,7 +253,9 @@ export function createApp(
       "Unhandled error"
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (typeof (err as any).statusCode === "number") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const appErr = err as any;
       res.status(appErr.statusCode).json({
         error: {
@@ -265,10 +287,24 @@ if (require.main === module) {
   const _stub = new Pool({ connectionString: DATABASE_URL }) as unknown as Database;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { loadConfig } = require("../config");
-  const PORT = loadConfig().port;
+  const config = loadConfig();
+  const PORT = config.port;
   const databaseUrl = process.env.DATABASE_URL;
-  const pg = databaseUrl ? new PgPool({ connectionString: databaseUrl }) : undefined;
-  const apiApp = pg ? createApp(new PostgresDatabase(pg), pg) : createApp(_stub);
+  // Same pool settings and monitoring as the main indexer process (issue
+  // #888): this API process holds its own pool, so it needs its own
+  // 'error' listener and configured limits, not just the ingestion pool's.
+  const pg = databaseUrl
+    ? new PgPool({
+        connectionString: databaseUrl,
+        max: config.dbPool.max,
+        idleTimeoutMillis: config.dbPool.idleTimeoutMs,
+        connectionTimeoutMillis: config.dbPool.connectionTimeoutMs,
+      })
+    : undefined;
+  if (pg) attachPoolMonitoring(pg, { logger, serviceName: "indexer-api" });
+  const apiApp = pg
+    ? createApp(new PostgresDatabase(pg), pg, undefined, undefined, loadConfig().mediaUpload)
+    : createApp(_stub);
 
   apiApp.listen(PORT, () => {
     console.log(`Indexer API listening on port ${PORT}`);

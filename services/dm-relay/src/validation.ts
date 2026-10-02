@@ -20,23 +20,39 @@ export function createSendMessageSchema(maxBytes: number = getMaxMessageBytes())
   return z.object({
     sender: stellarAddressSchema,
     recipient: stellarAddressSchema,
-    ciphertext_b64: base64Schema
-      .min(1)
-      .refine(
-        (val) => {
-          if (val.length > maxBase64Chars) return false;
-          return Buffer.from(val, "base64").length <= maxBytes;
-        },
-        {
-          message: `Ciphertext size exceeds maximum allowed size of ${maxBytes} bytes`,
-        }
-      ),
+    ciphertext_b64: base64Schema.min(1).refine(
+      (val) => {
+        if (val.length > maxBase64Chars) return false;
+        return Buffer.from(val, "base64").length <= maxBytes;
+      },
+      {
+        message: `Ciphertext size exceeds maximum allowed size of ${maxBytes} bytes`,
+      }
+    ),
     message_index: z.number().int().min(0).max(2147483647),
     timestamp: z.number().int().positive(),
     signature: hex64BytesSchema,
   });
 }
 
+// #1530 — Lazy schema factory. The old `const SendMessageSchema =
+// createSendMessageSchema()` was evaluated at import time, which happens
+// during `server.ts`'s own import resolution — before its `dotenv.config()`
+// call.  The configured MAX_MESSAGE_BYTES was never seen.  Callers that
+// need the schema should call `getSendMessageSchema()` after config is loaded.
+let _sendMessageSchema: z.ZodObject<any> | null = null;
+
+export function getSendMessageSchema(maxBytes?: number): z.ZodObject<any> {
+  if (!_sendMessageSchema || maxBytes !== undefined) {
+    _sendMessageSchema = createSendMessageSchema(maxBytes ?? getMaxMessageBytes());
+  }
+  return _sendMessageSchema;
+}
+
+/**
+ * @deprecated Use `getSendMessageSchema()` instead. Kept only so that
+ * existing test imports don't break.
+ */
 export const SendMessageSchema = createSendMessageSchema();
 
 export const GetMessagesQuerySchema = z.object({
@@ -57,21 +73,33 @@ export const ConversationIdParamSchema = z.object({
 export type SendMessageRequest = z.infer<typeof SendMessageSchema>;
 export type GetMessagesQuery = z.infer<typeof GetMessagesQuerySchema>;
 
-export function parseCursor(cursor: string): Date {
+/**
+ * #1529 — Composite cursor carrying both timestamp and id for tiebreaking.
+ * Messages written in the same transaction share an identical created_at,
+ * so a strict `created_at <` cursor can skip an entire group.  The cursor
+ * now encodes "created_at < $ts OR (created_at = $ts AND id < $id)".
+ */
+export interface CursorParts {
+  createdAt: Date;
+  id: string;
+}
+
+export function parseCursor(cursor: string): CursorParts {
   try {
     const decoded = Buffer.from(cursor, "base64").toString("utf-8");
-    const date = new Date(decoded);
+    const [tsStr, id] = decoded.split("|", 2);
+    const date = new Date(tsStr);
 
-    if (isNaN(date.getTime())) {
-      throw new Error("Invalid date in cursor");
+    if (isNaN(date.getTime()) || !id) {
+      throw new Error("Invalid cursor content");
     }
 
-    return date;
+    return { createdAt: date, id };
   } catch (error) {
     throw new Error("Invalid cursor format");
   }
 }
 
-export function createCursor(date: Date): string {
-  return Buffer.from(date.toISOString()).toString("base64");
+export function createCursor(date: Date, id: string): string {
+  return Buffer.from(`${date.toISOString()}|${id}`).toString("base64");
 }

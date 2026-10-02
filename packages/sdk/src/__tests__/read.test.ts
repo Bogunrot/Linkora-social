@@ -1,5 +1,6 @@
 import { LinkoraClient } from "../client";
 import { Profile, Post, Pool } from "../types";
+import { NetworkError } from "../errors";
 
 const mockSimulate = jest.fn();
 const mockCall = jest.fn();
@@ -301,10 +302,43 @@ describe("LinkoraClient read methods", () => {
     });
   });
 
-  describe("error mapping", () => {
+  describe("error mapping and discriminated read result (Issue #1359)", () => {
     it("throws mapped error for non-NotFound errors", async () => {
       simError("unauthorized action");
       await expect(client.getPostCount()).rejects.toThrow("Unauthorized");
+    });
+
+    it("distinguishes absent vs network error for getDmKey", async () => {
+      simError("HostError: Error(Storage, MissingValue)");
+      expect(await client.getDmKey("GUSER")).toBeNull();
+
+      simError("connection refused ECONNREFUSED");
+      await expect(client.getDmKey("GUSER")).rejects.toThrow(NetworkError);
+    });
+
+    it("distinguishes absent vs network error for getTreasury", async () => {
+      simError("HostError: Error(Storage, MissingValue)");
+      expect(await client.getTreasury()).toBeNull();
+
+      simError("fetch failed / timeout");
+      await expect(client.getTreasury()).rejects.toThrow(NetworkError);
+    });
+
+    it("returns discriminated ReadResult with executeReadResult", async () => {
+      success("GTREASURY");
+      const res1 = await client.executeReadResult(() => client.getTreasury());
+      expect(res1).toEqual({ ok: true, value: "GTREASURY" });
+
+      notFound();
+      const res2 = await client.executeReadResult(() => client.getProfile("GUSER"));
+      expect(res2).toEqual({ ok: true, value: null, absent: true });
+
+      simError("connection refused ECONNREFUSED");
+      const res3 = await client.executeReadResult(() => client.getDmKey("GUSER"));
+      expect(res3.ok).toBe(false);
+      if (!res3.ok) {
+        expect(res3.error.code).toBe("NETWORK_ERROR");
+      }
     });
   });
 
@@ -314,9 +348,11 @@ describe("LinkoraClient read methods", () => {
       expect(() => client.setProfile("GUSER", "alice", contractId)).not.toThrow();
     });
 
-    it("accepts valid account addresses (G...)", () => {
+    it("rejects account public keys as creator tokens (token params are contract-only)", () => {
       const accountKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-      expect(() => client.setProfile("GUSER", "alice", accountKey)).not.toThrow();
+      expect(() => client.setProfile("GUSER", "alice", accountKey)).toThrow(
+        "creatorToken must be a valid Soroban contract address"
+      );
     });
 
     it("rejects invalid addresses", () => {
@@ -359,16 +395,15 @@ describe("custom network Horizon URL", () => {
     }
   });
 
-  it("throws ValidationError for custom network without horizonUrl", async () => {
-    const customClient = new LinkoraClient({
-      contractId: "CDUMMY",
-      rpcUrl: "https://dummy.example.com",
-      networkPassphrase: "Custom Network",
-    });
-
-    await expect(customClient.prepareDmKeyTx("GUSER", new Uint8Array(32))).rejects.toThrow(
-      "Cannot determine Horizon URL"
-    );
+  it("throws ValidationError for custom network without horizonUrl", () => {
+    expect(
+      () =>
+        new LinkoraClient({
+          contractId: "CDUMMY",
+          rpcUrl: "https://dummy.example.com",
+          networkPassphrase: "Custom Network",
+        })
+    ).toThrow("Cannot determine Horizon URL");
   });
 
   it("defaults to testnet Horizon for Test passphrase", async () => {

@@ -24,7 +24,6 @@ const INIT: Symbol = symbol_short!("INIT");
 
 // ── Validation Constants ────────────────────────────────────────────────────────
 
-const MAX_DECIMALS: u32 = 38;
 const MAX_NAME_LEN: u32 = 64;
 const MAX_SYMBOL_LEN: u32 = 16;
 
@@ -53,6 +52,11 @@ pub struct CreatorTokenDeployedEvent {
     /// Token symbol/ticker, as passed to `deploy_creator_token`.
     pub symbol: String,
 }
+
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+pub const MAX_DECIMALS: u32 = 18;
+pub const MAX_INITIAL_SUPPLY: i128 = 100_000_000_000_000_000_000_000_000_000_000_i128;
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -166,12 +170,12 @@ impl TokenFactoryContract {
         );
         require_with_error!(
             &env,
-            name.len() > 0 && name.len() <= MAX_NAME_LEN,
+            !name.is_empty() && name.len() <= MAX_NAME_LEN,
             "name must be 1-64 characters"
         );
         require_with_error!(
             &env,
-            symbol.len() > 0 && symbol.len() <= MAX_SYMBOL_LEN,
+            !symbol.is_empty() && symbol.len() <= MAX_SYMBOL_LEN,
             "symbol must be 1-16 characters"
         );
 

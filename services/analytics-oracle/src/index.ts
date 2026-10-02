@@ -12,7 +12,8 @@ import { submitAttestation } from "./submitter.js";
 import { AnalyticsReport, SignedAttestation } from "./types.js";
 import { logger } from "./logger.js";
 import { rateLimiter, initRateLimiter } from "./middleware/rate-limiter.js";
-import { loadRateLimitConfig } from "./config.js";
+import { loadRateLimitConfig, dbPoolConfig } from "./config.js";
+import { attachPoolMonitoring } from "./db-pool-monitor.js";
 import { createHealthRouter } from "./routes/health.js";
 import { createAdminRouter } from "./routes/admin.js";
 import { validateParams } from "./middleware/validate.js";
@@ -41,11 +42,16 @@ const ORACLE_NAME = process.env["ORACLE_NAME"] ?? "default";
 const WINDOW_LEDGERS = BigInt(process.env["WINDOW_LEDGERS"] ?? "1000");
 const PORT = parseInt(process.env["PORT"] ?? "4000", 10);
 const NETWORK_PASSPHRASE = process.env["NETWORK_PASSPHRASE"] ?? "Test SDF Network ; September 2015";
-const ATTESTATION_CACHE_MAX_SIZE = parseInt(
-  process.env["ATTESTATION_CACHE_MAX_SIZE"] ?? "10000",
-  10
-);
-const ATTESTATION_CACHE_TTL_MS = parseInt(process.env["ATTESTATION_CACHE_TTL_MS"] ?? "3600000", 10);
+const ATTESTATION_CACHE_MAX_SIZE = (() => {
+  const val = parseInt(process.env["ATTESTATION_CACHE_MAX_SIZE"] ?? "10000", 10);
+  if (isNaN(val)) throw new Error("ATTESTATION_CACHE_MAX_SIZE must be a valid number");
+  return val;
+})();
+const ATTESTATION_CACHE_TTL_MS = (() => {
+  const val = parseInt(process.env["ATTESTATION_CACHE_TTL_MS"] ?? "3600000", 10);
+  if (isNaN(val)) throw new Error("ATTESTATION_CACHE_TTL_MS must be a valid number");
+  return val;
+})();
 const SHUTDOWN_DRAIN_TIMEOUT_MS = parseInt(process.env["SHUTDOWN_DRAIN_TIMEOUT_MS"] ?? "30000", 10);
 
 // Load the signing key from the configured secrets backend (a mounted secret
@@ -56,7 +62,19 @@ const oracleSeed = keystore.loadSeed();
 const oracleSigner = new Signer(oracleSeed);
 keystore.zeroise();
 
-const db = new Pool({ connectionString: DATABASE_URL });
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  max: dbPoolConfig.max,
+  idleTimeoutMillis: dbPoolConfig.idleTimeoutMillis,
+  connectionTimeoutMillis: dbPoolConfig.connectionTimeoutMillis,
+});
+// pool.on('error') is required: pg.Pool emits it when an idle client dies,
+// and an 'error' event with no listener crashes the process (issue #888).
+attachPoolMonitoring(db, {
+  logger,
+  serviceName: "analytics-oracle",
+  statsIntervalMs: dbPoolConfig.statsIntervalMs,
+});
 
 /** Shared rpc.Server instance — created once at startup and reused for all
  *  Soroban RPC calls (ledger polling + attestation submission). */
@@ -72,6 +90,9 @@ const attestationCache = new AttestationCache<SignedAttestation>({
 // cached signature produced under the previous key.
 const signerId = oracleSigner.fingerprint();
 attestationCache.setSignerId(signerId);
+oracleSigner.onRotate((fingerprint) => {
+  attestationCache.setSignerId(fingerprint);
+});
 
 let lastWindowEnd = BigInt(0);
 
@@ -103,71 +124,93 @@ async function runWindow(windowStart: bigint, windowEnd: bigint): Promise<void> 
     return;
   }
 
+  // Creators whose submission failed. A window that could not be fully
+  // attested is NOT treated as processed: runWindow rethrows at the end so
+  // scheduleLoop retries the window instead of advancing lastWindowEnd past a
+  // creator that was never confirmed on chain (#1536).
+  const failedCreators: string[] = [];
+
   for (const s of stats) {
-    let creatorBytes: Uint8Array;
     try {
-      creatorBytes = Keypair.fromPublicKey(s.creatorAddress).rawPublicKey();
-    } catch {
-      logger.warn({ creatorAddress: s.creatorAddress }, "Skipping invalid address");
-      continue;
-    }
+      let creatorBytes: Uint8Array;
+      try {
+        creatorBytes = Keypair.fromPublicKey(s.creatorAddress).rawPublicKey();
+      } catch {
+        logger.warn({ creatorAddress: s.creatorAddress }, "Skipping invalid address");
+        continue;
+      }
 
-    const report: AnalyticsReport = {
-      version: 1,
-      creator: creatorBytes,
-      windowStart,
-      windowEnd,
-      totalTips: s.totalTips,
-      postCount: s.postCount,
-      followerDelta: s.followerDelta,
-      uniqueTippers: s.uniqueTippers,
-    };
-
-    const reportCbor = encodeReport(report);
-    const { signature, reportHash } = oracleSigner.signReport(reportCbor);
-
-    // Audit log: every signing includes the public-key fingerprint and the
-    // ledger window, never the private key material.
-    logger.info(
-      {
-        fingerprint: oracleSigner.fingerprint(),
-        creatorAddress: s.creatorAddress,
-        windowStart: windowStart.toString(),
-        windowEnd: windowEnd.toString(),
-        reportHash: reportHash.toString("hex"),
-      },
-      "Attestation signed"
-    );
-
-    let txHash: string;
-    try {
-      txHash = await submitAttestation(
-        rpcServer,
-        NETWORK_PASSPHRASE,
-        CONTRACT_ID,
-        ORACLE_NAME,
-        reportCbor,
-        signature,
-        oracleSigner.keypair(),
-        s.creatorAddress,
+      const report: AnalyticsReport = {
+        version: 1,
+        creator: creatorBytes,
         windowStart,
-        windowEnd
+        windowEnd,
+        totalTips: s.totalTips,
+        postCount: s.postCount,
+        followerDelta: s.followerDelta,
+        uniqueTippers: s.uniqueTippers,
+      };
+
+      const reportCbor = encodeReport(report);
+      const { signature, reportHash } = oracleSigner.signReport(reportCbor);
+
+      // Audit log: every signing includes the public-key fingerprint and the
+      // ledger window, never the private key material.
+      logger.info(
+        {
+          fingerprint: oracleSigner.fingerprint(),
+          creatorAddress: s.creatorAddress,
+          windowStart: windowStart.toString(),
+          windowEnd: windowEnd.toString(),
+          reportHash: reportHash.toString("hex"),
+        },
+        "Attestation signed"
       );
-      logger.info({ creatorAddress: s.creatorAddress, txHash }, "Creator attested");
+
+      let txHash: string;
+      try {
+        txHash = await submitAttestation(
+          rpcServer,
+          NETWORK_PASSPHRASE,
+          CONTRACT_ID,
+          ORACLE_NAME,
+          reportCbor,
+          signature,
+          oracleSigner.keypair(),
+          s.creatorAddress,
+          windowStart,
+          windowEnd
+        );
+        logger.info({ creatorAddress: s.creatorAddress, txHash }, "Creator attested");
+      } catch (err) {
+        logger.error({ creatorAddress: s.creatorAddress, err }, "Attestation submission failed");
+        failedCreators.push(s.creatorAddress);
+        continue;
+      }
+
+      attestationCache.set(s.creatorAddress, {
+        oracleName: ORACLE_NAME,
+        signerKey: oracleSigner.fingerprint(),
+        keyVersion: oracleSigner.keyVersion,
+        rotationEpoch: oracleSigner.rotationEpoch,
+        reportCbor,
+        reportHash: reportHash.toString("hex"),
+        signature,
+        txHash,
+        report,
+        submittedAt: Date.now(),
+      });
     } catch (err) {
-      logger.error({ creatorAddress: s.creatorAddress, err }, "Attestation submission failed");
+      logger.error({ creatorAddress: s.creatorAddress, err }, "Error processing creator stats");
+      failedCreators.push(s.creatorAddress);
       continue;
     }
+  }
 
-    attestationCache.set(s.creatorAddress, {
-      oracleName: ORACLE_NAME,
-      reportCbor,
-      reportHash: reportHash.toString("hex"),
-      signature,
-      txHash,
-      report,
-      submittedAt: Date.now(),
-    });
+  if (failedCreators.length > 0) {
+    throw new Error(
+      `Window ${windowStart.toString()}..${windowEnd.toString()}: ${failedCreators.length} creator(s) failed to submit a confirmed attestation: ${failedCreators.join(", ")}`
+    );
   }
 }
 
@@ -180,13 +223,48 @@ async function scheduleLoop(currentLedger: bigint): Promise<void> {
     return;
   }
 
-  // Window-start invalidation: cached attestations reference the *previous*
-  // report window, which is now closed. Drop them so a stale attestation is
-  // never served once the oracle begins covering the new window.
-  attestationCache.beginWindow(windowStart, windowEnd);
+  const MAX_RETRIES = 3;
+  let attempt = 0;
+  let success = false;
+  let lastError: unknown;
 
-  lastWindowEnd = windowEnd;
-  await runWindow(windowStart, windowEnd);
+  while (attempt < MAX_RETRIES && !success) {
+    attempt++;
+    try {
+      // Window-start invalidation: cached attestations reference the *previous*
+      // report window, which is now closed. Drop them so a stale attestation is
+      // never served once the oracle begins covering the new window.
+      attestationCache.beginWindow(windowStart, windowEnd);
+      await runWindow(windowStart, windowEnd);
+      success = true;
+    } catch (err) {
+      lastError = err;
+      logger.warn(
+        {
+          attempt,
+          maxRetries: MAX_RETRIES,
+          windowStart: windowStart.toString(),
+          windowEnd: windowEnd.toString(),
+          err,
+        },
+        "Window processing failed, retrying"
+      );
+      if (attempt < MAX_RETRIES) {
+        const backoffMs = Math.pow(2, attempt - 1) * 100;
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
+  }
+
+  if (success) {
+    lastWindowEnd = windowEnd;
+  } else {
+    logger.error(
+      { windowStart: windowStart.toString(), windowEnd: windowEnd.toString(), err: lastError },
+      "Window processing failed after retries; lastWindowEnd not advanced"
+    );
+    throw lastError;
+  }
 }
 
 const app = express();
@@ -248,6 +326,9 @@ app.get("/attestations/:creator", validateParams(creatorParamsSchema), (req, res
 
   res.json({
     oracleName: att.oracleName,
+    signerKey: att.signerKey,
+    keyVersion: att.keyVersion,
+    rotationEpoch: att.rotationEpoch,
     reportHash: att.reportHash,
     reportCbor: att.reportCbor.toString("hex"),
     signature: att.signature.toString("hex"),

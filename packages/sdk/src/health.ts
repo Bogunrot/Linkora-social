@@ -5,6 +5,14 @@ import { TimeoutError } from "./errors.js";
 export type ConnectionStatus = "connected" | "disconnected";
 export type ConnectionStatusCallback = (status: ConnectionStatus) => void;
 
+export interface RpcHealthResult {
+  healthy: boolean;
+  expectedNetworkPassphrase: string;
+  networkPassphrase?: string;
+  latestLedgerSequence?: number;
+  error?: string;
+}
+
 /**
  * Aggregate retry telemetry recorded from a {@link TransactionQueue}'s retry loop.
  */
@@ -56,6 +64,8 @@ export class ConnectionHealthMonitor {
   private readonly backoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly pingTimeoutMs: number;
+  private readonly expectedNetworkPassphrase: string;
+  private readonly server: rpc.Server;
 
   private status: ConnectionStatus = "disconnected";
   private listeners: ConnectionStatusCallback[] = [];
@@ -63,15 +73,23 @@ export class ConnectionHealthMonitor {
   private stopped = false;
   private hasChecked = false;
   private retryMetrics: RetryMetrics = emptyRetryMetrics();
+  private readonly _server?: rpc.Server;
 
-private boundResume = () => this.resume();
+  private boundResume = () => this.resume();
 
-  constructor(rpcUrl: string, config: HealthCheckConfig = {}) {
+  constructor(
+    rpcUrl: string,
+    config: HealthCheckConfig = {},
+    server?: rpc.Server,
+    expectedNetworkPassphrase = "Test SDF Network ; September 2015"
+  ) {
     this.rpcUrl = rpcUrl;
     this.intervalMs = config.intervalMs ?? 30_000;
     this.backoffMs = config.backoffMs ?? 1_000;
     this.maxBackoffMs = config.maxBackoffMs ?? 30_000;
     this.pingTimeoutMs = config.pingTimeoutMs ?? 10_000;
+    this.expectedNetworkPassphrase = expectedNetworkPassphrase;
+    this.server = server ?? new rpc.Server(this.rpcUrl, { allowHttp: false });
 
     if (typeof window !== "undefined") {
       window.addEventListener("online", this.boundResume);
@@ -99,24 +117,52 @@ private boundResume = () => this.resume();
 
   /** Perform a single health check ping against the RPC endpoint. */
   async healthCheck(): Promise<boolean> {
+    return (await this.getHealthResult()).healthy;
+  }
+
+  /** Check RPC reachability, network identity, and the latest ledger response. */
+  async getHealthResult(): Promise<RpcHealthResult> {
     try {
-      // Insecure HTTP is disabled by default (safe-by-default). A health check
-      // against a plaintext endpoint will simply report disconnected unless the
-      // endpoint was explicitly opted-in when constructing the client.
-      const server = new rpc.Server(this.rpcUrl, {
-        allowHttp: false,
-      });
-      const result = await withTimeout(
-        server.getLatestLedger(),
+      const network = await withTimeout(
+        this.server.getNetwork(),
+        this.pingTimeoutMs,
+        `Network identity check timed out after ${this.pingTimeoutMs}ms`
+      );
+      if (network.passphrase !== this.expectedNetworkPassphrase) {
+        return {
+          healthy: false,
+          expectedNetworkPassphrase: this.expectedNetworkPassphrase,
+          networkPassphrase: network.passphrase,
+          error: "RPC network passphrase does not match the configured network.",
+        };
+      }
+      const ledger = await withTimeout(
+        this.server.getLatestLedger(),
         this.pingTimeoutMs,
         `Health check timed out after ${this.pingTimeoutMs}ms`
       );
-      return result !== null;
-    } catch {
-      return false;
+      if (!Number.isSafeInteger(ledger.sequence) || ledger.sequence <= 0) {
+        return {
+          healthy: false,
+          expectedNetworkPassphrase: this.expectedNetworkPassphrase,
+          networkPassphrase: network.passphrase,
+          error: "RPC returned an invalid latest ledger sequence.",
+        };
+      }
+      return {
+        healthy: true,
+        expectedNetworkPassphrase: this.expectedNetworkPassphrase,
+        networkPassphrase: network.passphrase,
+        latestLedgerSequence: ledger.sequence,
+      };
+    } catch (error) {
+      return {
+        healthy: false,
+        expectedNetworkPassphrase: this.expectedNetworkPassphrase,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
-
 
   /** Alias for start(). Useful for resuming after a sustained outage stops polling. */
   resume(): void {
@@ -160,7 +206,10 @@ private boundResume = () => this.resume();
   }
 
   private scheduleCheck(delayMs: number): void {
-    const baseJitter = delayMs === 0 ? Math.random() * this.backoffMs : delayMs * 0.2 * Math.random();
+    const baseJitter =
+      delayMs === 0
+        ? Math.random() * Math.min(this.intervalMs, 100)
+        : delayMs * 0.2 * Math.random();
     this.timer = setTimeout(() => this.runCheck(), delayMs + baseJitter);
   }
 

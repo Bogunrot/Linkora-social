@@ -65,12 +65,19 @@ export class InvalidManifestError extends LinkoraError {
  * Thrown when transaction simulation fails. Contains the full diagnostic event log.
  */
 export class SimulationError extends LinkoraError {
+  public error?: string;
+  public hostError?: string;
+
   constructor(
     message: string,
     public readonly eventLog?: unknown,
-    originalError?: unknown
+    originalError?: unknown,
+    error?: string,
+    hostError?: string
   ) {
     super(message, "SIMULATION_FAILED", undefined, originalError);
+    this.error = error;
+    this.hostError = hostError;
   }
 }
 
@@ -128,6 +135,17 @@ export class TimeoutError extends LinkoraError {
 }
 
 /**
+ * Raised when every bounded retry attempt for an idempotent request has
+ * failed (issue #1363). Carries the number of attempts made and the final
+ * transport error as `originalError`.
+ */
+export class RetryExhaustedError extends LinkoraError {
+  constructor(message: string, details?: Record<string, unknown>, originalError?: unknown) {
+    super(message, "RETRY_EXHAUSTED", details, originalError);
+  }
+}
+
+/**
  * Thrown when an on-chain contract invocation fails (simulation error, contract
  * FAILED status, or a diagnostic trap returned by Soroban).
  */
@@ -148,6 +166,25 @@ export class CircuitBreakerError extends LinkoraError {
   }
 }
 
+/**
+ * Thrown when the deployed contract version or capability marker does not match SDK expectation.
+ */
+export class VersionMismatchError extends LinkoraError {
+  constructor(message: string, details?: Record<string, unknown>, originalError?: unknown) {
+    super(message, "VERSION_MISMATCH", details, originalError);
+  }
+}
+
+/**
+ * Discriminated result type for on-chain read operations.
+ * Callers can explicitly distinguish valid data, genuinely empty/absent data, and errors.
+ */
+export type ReadResult<T> =
+  | { ok: true; value: T; absent?: false }
+  | { ok: true; value: null; absent: true }
+  | { ok: false; error: LinkoraError };
+
+
 // ── Contract error codes ──────────────────────────────────────────────────────
 
 export enum ContractErrorCode {
@@ -164,6 +201,11 @@ export enum ContractErrorCode {
   PostTooLong = 11,
   InvalidInput = 12,
   SimulationFailed = 13,
+  ContractPanic = 14,
+  Overflow = 15,
+  Underflow = 16,
+  DivisionByZero = 17,
+  OutOfBounds = 18,
 }
 
 type ErrorConstructor = new (
@@ -186,6 +228,11 @@ const errorCodeRegistry: Map<ContractErrorCode, ErrorConstructor> = new Map([
   [ContractErrorCode.PostTooLong, ValidationError],
   [ContractErrorCode.InvalidInput, ValidationError],
   [ContractErrorCode.SimulationFailed, ContractError],
+  [ContractErrorCode.ContractPanic, ContractError],
+  [ContractErrorCode.Overflow, ValidationError],
+  [ContractErrorCode.Underflow, ValidationError],
+  [ContractErrorCode.DivisionByZero, ValidationError],
+  [ContractErrorCode.OutOfBounds, ValidationError],
 ]);
 
 function tryMapByErrorCode(err: unknown): LinkoraError | null {
@@ -298,6 +345,15 @@ function mapByRegex(msg: string, err: unknown): LinkoraError {
   if (/blocked/i.test(msg)) {
     return new UnauthorizedError("Operation rejected: user has blocked you.", undefined, err);
   }
+  if (/overflow|underflow|division by zero|out of bounds/i.test(msg)) {
+    return new ValidationError(`Contract math or bounds assertion failed: ${msg}`, { rawMessage: msg }, err);
+  }
+  if (/assert!|assertion failed/i.test(msg)) {
+    return new ValidationError(`Contract assertion failed: ${msg}`, { rawMessage: msg }, err);
+  }
+  if (/panic!\((?:.*)\)|contract panic|panic/i.test(msg)) {
+    return new ContractError(`Contract panic: ${msg}`, { rawMessage: msg, unmapped: false }, err);
+  }
   if (/sign|freighter|ledger|wallet/i.test(msg)) {
     return new SigningError(msg, undefined, err);
   }
@@ -310,8 +366,8 @@ function mapByRegex(msg: string, err: unknown): LinkoraError {
   if (/invalid|too long|must be positive|cannot exceed/i.test(msg)) {
     return new ValidationError(`Invalid input parameters: ${msg}`, undefined, err);
   }
-  if (/simulation failed|trap|contract error|host function/i.test(msg)) {
-    return new ContractError(msg, undefined, err);
+  if (/simulation failed|trap|contract error|host function|HostError/i.test(msg)) {
+    return new ContractError(msg, { rawMessage: msg }, err);
   }
   if (
     /connection|network|timeout|ECONNREFUSED|ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ENETDOWN|fetch (?:failed|to connect)|load failed|net::ERR_|unreachable/i.test(
@@ -321,11 +377,14 @@ function mapByRegex(msg: string, err: unknown): LinkoraError {
     return new NetworkError(msg, undefined, err);
   }
 
-  return new LinkoraError(msg, "LINKORA_ERROR", undefined, err);
+  // Preserve raw context for unmapped panics/errors for triage
+  return new ContractError(msg, { rawMessage: msg, unmapped: true }, err);
 }
 
-// TODO(#1043): Add instanceof SimulationError check before regex fallback
 export function mapError(err: unknown): LinkoraError {
+  if (err instanceof SimulationError) {
+    return err;
+  }
   const codeMapped = tryMapByErrorCode(err);
   if (codeMapped) return codeMapped;
 
@@ -334,4 +393,19 @@ export function mapError(err: unknown): LinkoraError {
 
   const msg = err instanceof Error ? err.message : String(err);
   return mapByRegex(msg, err);
+}
+
+/**
+ * Thrown when importing a portable signed transaction fails: malformed
+ * payload, tampered XDR (digest mismatch), wrong network, unsigned
+ * envelope, or unparseable XDR (issue #1357).
+ */
+export class InvalidSignedTransactionError extends LinkoraError {
+  constructor(
+    message: string,
+    details?: Record<string, unknown>,
+    originalError?: unknown
+  ) {
+    super(message, "INVALID_SIGNED_TRANSACTION", details, originalError);
+  }
 }
