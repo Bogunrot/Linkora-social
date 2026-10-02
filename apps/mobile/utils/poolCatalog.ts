@@ -120,6 +120,8 @@ export function formatPoolBalance(balance: string, token: string): string {
   if (!match) return trimmed;
 
   const [, amount, suffix] = match;
+  if (amount === undefined) return trimmed;
+
   const numeric = Number(amount.replace(/,/g, ""));
   if (!Number.isFinite(numeric)) return trimmed;
 

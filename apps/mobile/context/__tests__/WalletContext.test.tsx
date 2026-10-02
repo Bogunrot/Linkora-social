@@ -24,15 +24,18 @@ jest.mock("expo-secure-store", () => ({
   }),
 }));
 
+/** Mutable so a test can simulate the user switching networks in settings. */
+const mockSelectedNetwork = { id: "TESTNET" };
+
 jest.mock("../NetworkContext", () => {
   const actual = jest.requireActual("../NetworkContext");
   return {
     ...actual,
     useNetworkContext: () => ({
-      network: actual.NETWORK_PRESETS.TESTNET,
+      network: actual.NETWORK_PRESETS[mockSelectedNetwork.id],
       settings: {
-        selectedNetwork: "TESTNET",
-        rpcUrl: actual.NETWORK_PRESETS.TESTNET.rpcUrl,
+        selectedNetwork: mockSelectedNetwork.id,
+        rpcUrl: actual.NETWORK_PRESETS[mockSelectedNetwork.id].rpcUrl,
       },
     }),
   };
@@ -92,6 +95,7 @@ function renderWallet() {
 describe("WalletContext session persistence (#1593)", () => {
   beforeEach(() => {
     mockSecureStore.clear();
+    mockSelectedNetwork.id = "TESTNET";
     globalThis.__LINKORA_WALLET_KIT__ = makeKit() as never;
     globalThis.__LINKORA_FREIGHTER_API__ = makeFreighter();
   });
@@ -152,14 +156,36 @@ describe("WalletContext session persistence (#1593)", () => {
     expect(freighter.requestAccess).not.toHaveBeenCalled();
   });
 
-  it("keeps the network the session was established on instead of hardcoding TESTNET", async () => {
+  it("records the network the session was established on, without hardcoding TESTNET", async () => {
     await seedSession("freighter", { network: "MAINNET" });
 
     const { result } = renderWallet();
 
     await waitFor(() => expect(result.current.state).toBe("connected"));
-    expect(result.current.network).toBe("MAINNET");
+    // The session's origin network is preserved as provenance...
     expect(result.current.wallet.network).toBe("MAINNET");
+    // ...while the active network is the one the app has selected, not the
+    // hardcoded "TESTNET" this used to be seeded with.
+    expect(result.current.network).toBe("TESTNET");
+  });
+
+  it("follows a network switch instead of reporting a stale network (#1593)", async () => {
+    await seedSession("freighter", { network: "TESTNET" });
+
+    const { result, rerender } = renderWallet();
+    await waitFor(() => expect(result.current.state).toBe("connected"));
+    expect(result.current.network).toBe("TESTNET");
+
+    await act(async () => {
+      mockSelectedNetwork.id = "MAINNET";
+    });
+    // Re-render so the provider reads the new selection.
+    rerender({});
+
+    expect(result.current.network).toBe("MAINNET");
+    // Switching networks must not disturb the live session.
+    expect(result.current.state).toBe("connected");
+    expect(result.current.wallet.address).toBe(ADDRESS);
   });
 
   it("probes both adapters for a legacy session and records the one that matched", async () => {
