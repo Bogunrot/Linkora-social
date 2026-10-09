@@ -10,11 +10,10 @@ jest.mock("@/components/WalletProvider", () => ({
   useWalletContext: jest.fn(),
 }));
 
-const mockUseNotificationsContext =
-  useNotificationsContext as jest.MockedFunction<typeof useNotificationsContext>;
-const mockUseWalletContext = useWalletContext as jest.MockedFunction<
-  typeof useWalletContext
+const mockUseNotificationsContext = useNotificationsContext as jest.MockedFunction<
+  typeof useNotificationsContext
 >;
+const mockUseWalletContext = useWalletContext as jest.MockedFunction<typeof useWalletContext>;
 
 class FakeWebSocket {
   onopen: (() => void) | null = null;
@@ -56,10 +55,7 @@ const ITEM = {
 };
 
 function seedUnread() {
-  window.localStorage.setItem(
-    `linkora:notifications:items:${ADDR}`,
-    JSON.stringify([ITEM])
-  );
+  window.localStorage.setItem(`linkora:notifications:items:${ADDR}`, JSON.stringify([ITEM]));
   window.localStorage.setItem("linkora:notifications:unread", "2");
 }
 
@@ -108,5 +104,12 @@ describe("useNotifications markRead (#1306)", () => {
     });
 
     expect(decrementUnread).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not construct any WebSocket connection on mount (#1583)", () => {
+    const wsConstructorSpy = jest.fn();
+    (globalThis as any).WebSocket = wsConstructorSpy;
+    renderHook(() => useNotifications());
+    expect(wsConstructorSpy).not.toHaveBeenCalled();
   });
 });
